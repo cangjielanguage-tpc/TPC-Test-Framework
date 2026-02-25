@@ -1585,6 +1585,7 @@ def pareFile(path):
             "RESOURCES": [],
             "DEPENDENCE": []
         }
+        is_unit_test = False
         for item in lines:
             exec = filter_line(item, "// EXEC")
             dep = filter_line(item, "// DEPENDENCE")
@@ -1592,8 +1593,12 @@ def pareFile(path):
             if exec:
                 if platform.system() == 'Windows' and exec[:6] == './main':
                     exec = '.\\main.exe ' + exec[6:]
-                if (exec[:6] == './main' or exec[:6] == '.\\main') and '--no-progress' not in exec:
+
+                if is_unit_test and exec[:6] == './main':
                     exec += ' --no-progress'
+                if 'cjc' in exec and '--test' in exec:
+                    is_unit_test = True
+                    exec += " --debug-macro"
                 dicts.get("EXEC").append(exec)
             if dep:
                 for item2 in dep.split(" "):
