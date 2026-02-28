@@ -973,6 +973,7 @@ def cjpmbuild(args, cfgs):
 
 
 def __do_cjpm_build(args, cfgs):
+    cmd1 = [get_cjc_cpm(cfgs), "build"]
     if args.full:
         cmd0 = "{} update".format(get_cjc_cpm(cfgs))
         output = subprocess.Popen(cmd0, shell=True, cwd=cfgs.HOME_DIR, stderr=subprocess.PIPE, stdout=subprocess.PIPE)
@@ -991,22 +992,60 @@ def __do_cjpm_build(args, cfgs):
                 _, err_log = __log_output(output, output.args, cfgs, cfgs.HOME_DIR)
             else:
                 cfgs.LOG.error("build fail")
-        cmd1 = "{} build".format(get_cjc_cpm(cfgs))
     else:
-        cmd1 = "{} build -i".format(get_cjc_cpm(cfgs))
+        cmd1.append("-i")
     if args.coverage:
-        cmd1 += " --coverage"
+        cmd1.append("--coverage")
     elif args.release:
-        cmd1 += " --release"
+        ci_test_cfg = cfgs.BUILD_PARMS
+        if 'profile' in ci_test_cfg and 'customized-option' in ci_test_cfg['profile'] and 'release' in ci_test_cfg['profile']['customized-option']:
+            cmd1.append("--release")
+        else:
+            if cfgs.UPDATE_CJPM_TOML or args.update_toml:
+                ci_test_cfg['profile'] = {
+                    'build': {
+                        'incremental': True,
+                        'lto': ""
+                    },
+                    'customized-option': {
+                        'debug': "-g -Woff all -Won apilevel-check",
+                        'release': "--fast-math -O2 -s -Woff all -Won apilevel-check"
+                    },
+                    'test': {}
+                }
+                with open(os.path.join(cfgs.HOME_DIR, "cjpm.toml"), "w", encoding='UTF-8') as toml_f:
+                    cfgs.LOG.info("正在将profile环境写入cjpm.toml")
+                    dump_c(ci_test_cfg, toml_f)
+                cmd1.append("--release")
     elif args.debug:
-        cmd1 += " --debug"
+        ci_test_cfg = cfgs.BUILD_PARMS
+        if 'profile' in ci_test_cfg and 'customized-option' in ci_test_cfg['profile'] and 'debug' in \
+                ci_test_cfg['profile']['customized-option']:
+            cmd1.append("--debug")
+        else:
+            if cfgs.UPDATE_CJPM_TOML or args.update_toml:
+                ci_test_cfg['profile'] = {
+                    'build': {
+                        'incremental': True,
+                        'lto': ""
+                    },
+                    'customized-option': {
+                        'debug': "-g -Woff all -Won apilevel-check",
+                        'release': "--fast-math -O2 -s -Woff all -Won apilevel-check"
+                    },
+                    'test': {}
+                }
+                with open(os.path.join(cfgs.HOME_DIR, "cjpm.toml"), "w", encoding='UTF-8') as toml_f:
+                    cfgs.LOG.info("正在将profile环境写入cjpm.toml")
+                    dump_c(ci_test_cfg, toml_f)
+                cmd1.append("--debug")
     if args.verbose:
-        cmd1 += " --verbose"
+        cmd1.append("--verbose")
     if args.target and str(args.target).__contains__("ohos"):
         # 读取 DEVECO_CANGJIE_HOME 环境变量
         _get_DEVECO_CANGJIE_HOME(cfgs)
-        cmd1 += " --target=aarch64-linux-ohos"
-    return subprocess.Popen(cmd1, shell=True, cwd=cfgs.HOME_DIR, stderr=subprocess.PIPE,
+        cmd1.append("--target=aarch64-linux-ohos")
+    return subprocess.Popen(" ".join(cmd1), shell=True, cwd=cfgs.HOME_DIR, stderr=subprocess.PIPE,
                             stdout=subprocess.PIPE)
     # return log_output(output, output.args,cfgs, cfgs.HOME_DIR)
 
@@ -1321,34 +1360,6 @@ def copy_windows_lib(args):
 def find_lib_path(lib_path, ci_lib_path):
     cj_3rd_libs = set()
     """查找三方依赖库 """
-    # if ci_lib_path != "":  ## cjtest
-    #     lib_path_parent = os.path.dirname(lib_path)
-    #     ci_lib_path_parent = os.path.dirname(ci_lib_path)
-    #     if os.path.exists(lib_path_parent) and not os.path.exists(lib_path):
-    #         for dir in os.listdir(lib_path_parent):
-    #             if str(dir) == "release":
-    #                 for dd in os.listdir(os.path.join(lib_path_parent, "release")):
-    #                     if str(dd).__contains__(".") or str(dd) == "bin":
-    #                         continue
-    #                     cj_3rd_libs.add(os.path.join(lib_path_parent, "release", dd))
-    #             else:
-    #                 if not str(dir).__contains__(".") and str(dir) != "bin":
-    #                     cj_3rd_libs.add(os.path.join(lib_path_parent, dir))
-    #     elif os.path.exists(lib_path):
-    #         cj_3rd_libs.add(lib_path)
-    #     elif os.path.exists(ci_lib_path_parent) and not os.path.exists(ci_lib_path):
-    #         for dir in os.listdir(ci_lib_path_parent):
-    #             if str(dir) == "release":
-    #                 for dd in os.listdir(os.path.join(ci_lib_path_parent, "release")):
-    #                     if str(dd).__contains__(".") or str(dd) == "bin":
-    #                         continue
-    #                     cj_3rd_libs.add(os.path.join(ci_lib_path_parent, "release", dd))
-    #             else:
-    #                 if not str(dir).__contains__(".") and str(dir) != "bin":
-    #                     cj_3rd_libs.add(os.path.join(ci_lib_path_parent, "release"))
-    #     elif os.path.exists(ci_lib_path):
-    #         cj_3rd_libs.add(ci_lib_path)
-    # else:  ## LLT test
     if os.path.exists(os.path.join(lib_path, "release")):
         cj_3rd_libs.add(os.path.join(lib_path, "release"))
     elif os.path.exists(lib_path):
