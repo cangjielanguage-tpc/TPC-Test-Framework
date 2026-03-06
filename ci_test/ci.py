@@ -104,12 +104,13 @@ def parse_args(cfgs):
     coverage_parser = sub_parser.add_parser("coverage", help="生成覆盖率报告的命令")
     coverage_parser.set_defaults(func=coverage)
     coverage_parser.add_argument("--html", action='store_true', help="跑完用例之后执行的命令, 用于生成html覆盖率报告")
+    coverage_parser.add_argument("-e", help="排除的文件路径")
     coverage_parser.add_argument("-b", action='store_true', help="跑完用例之后执行的命令, 和--html一起合用, 用于生成html覆盖率分支覆盖报告")
     coverage_parser_optimize = coverage_parser.add_mutually_exclusive_group()
     coverage_parser_optimize.add_argument('--LLT', action='store_true', help="指定跑LLT用例覆盖率")
     coverage_parser_optimize.add_argument('--HLT', action='store_true', help="指定跑HLT用例覆盖率")
-    clean_parser = sub_parser.add_parser("clean", help="清空缓存文件")
-    clean_parser.set_defaults(func=clean)
+    # clean_parser = sub_parser.add_parser("clean", help="清空缓存文件")
+    # clean_parser.set_defaults(func=clean)
     version_parser = sub_parser.add_parser("version", help="打印脚本版本信息")
     version_parser.set_defaults(func=print_version)
     version_parser.add_argument("--cangjie", action='store_true', help="打印仓颉项目版本")
@@ -209,6 +210,7 @@ def parse_args(cfgs):
 
     par = parser.parse_args()
     par.CANGJIE_CI_TEST_CFGS = cfgs
+    # raise Exception
     if len(sys.argv) == 1:
         parser.print_help()
         sys.exit(1)
@@ -340,17 +342,10 @@ def main(cfgs):
     parse_args(cfgs)
 
 
-def clean(cfgs):
-    cfgs.LOG.info("start clear")
-    shutil.rmtree(cfgs.temp_dir, ignore_errors=True)
-    shutil.rmtree(cfgs.log_dir, ignore_errors=True)
-    cfgs.LOG.info("end clear")
-
-
 def coverage(args):
     set_args_default_attribute(args)
     cfgs = args.CANGJIE_CI_TEST_CFGS
-    args.e = None
+    # args.e = None
     args.coverage = True
     args.clean = False
     args.target = args.ohos_home = args.cj_home = args.case = args.ut = args.path = args.O2 = args.O1 = args.O0 = args.full = None
@@ -1039,7 +1034,7 @@ def __do_cjpm_build(args, cfgs):
                     cfgs.LOG.info("正在将profile环境写入cjpm.toml")
                     dump_c(ci_test_cfg, toml_f)
                 cmd1.append("--debug")
-    if args.verbose:
+    if hasattr(args, 'verbose') and args.verbose:
         cmd1.append("--verbose")
     if args.target and str(args.target).__contains__("ohos"):
         # 读取 DEVECO_CANGJIE_HOME 环境变量
