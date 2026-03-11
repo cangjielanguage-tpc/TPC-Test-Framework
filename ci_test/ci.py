@@ -519,7 +519,7 @@ def test(args):
         else:
             cfgs.LOG.error("指定文件夹不存在. 请重试")
             exit(1)
-    clean(cfgs)
+    # clean(cfgs)
     if args.coverage:
         args.optimize = ' -O0 --coverage'
     elif args.O is None:
