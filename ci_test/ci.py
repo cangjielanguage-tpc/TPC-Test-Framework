@@ -29,6 +29,8 @@ from tomlkit import parse, dump as dump_c
 from logging import handlers
 from logging.handlers import TimedRotatingFileHandler
 import xml.etree.cElementTree as Et
+from get_stdx_release import get_cjc_version_from_command, generate_possible_urls, find_valid_urls, \
+    find_closest_version, download_and_extract
 
 dynamic_lib = ".dll" if platform.system() == "Windows" else ".so"
 static_lib = ".lib" if platform.system() == "Windows" else ".a"
@@ -572,7 +574,6 @@ def __find_cjpm_home_librarys(args, cfgs):
         cfgs.LOG.error(f"函数__find_cjpm_home_librarys，遇到异常错误 {e}")
 
 
-
 def __get_windows_c_lib_arr(cfgs, sub_lib):
     for path, _, libs in os.walk(sub_lib):
         for lib in libs:
@@ -623,6 +624,7 @@ def download_large_with_urllib(url, save_path, chunk_size=1024 * 1024):
     except urllib.error.URLError as e:
         print(f"\n下载失败：{e}")
 
+
 # 解压stdx 文件
 def unzip_file(zip_path, extract_dir):
     """
@@ -643,6 +645,56 @@ def unzip_file(zip_path, extract_dir):
         print(f"解压失败：{zip_path} 不是有效的 ZIP 文件")
     except Exception as e:
         print(f"解压失败：{e}")
+
+
+def download_stdx_with_new_tool(cfgs, target_dir):
+    """
+    使用 get_stdx_release.py 的工具下载 stdx
+    """
+    try:
+        cfgs.LOG.info("使用新工具下载 stdx...")
+
+        cjc_info = get_cjc_version_from_command(cfgs.LOG)
+        if not cjc_info:
+            cfgs.LOG.error("无法获取 cjc 版本信息")
+            return False
+
+        cfgs.LOG.info(f"检测到 cjc 版本: {cjc_info.get('version', 'unknown')}")
+        cfgs.LOG.info(f"目标平台: {cjc_info.get('target', 'unknown')}")
+
+        possible_urls = generate_possible_urls(cjc_info, 'Cangjie', 'cangjie_stdx')
+        if not possible_urls:
+            cfgs.LOG.error("无法生成可能的 stdx URL")
+            return False
+
+        cfgs.LOG.info(f"生成了 {len(possible_urls)} 个可能的 URL，正在检查有效性...")
+
+        valid_urls = find_valid_urls(possible_urls, max_workers=10, logger=cfgs.LOG)
+
+        if not valid_urls:
+            cfgs.LOG.error("未找到有效的 stdx 包")
+            cfgs.LOG.info("提示: 请访问 https://gitcode.com/Cangjie/cangjie_stdx/releases 手动下载")
+            return False
+
+        cfgs.LOG.info(f"找到 {len(valid_urls)} 个有效的 stdx 包")
+
+        closest_packages = find_closest_version(valid_urls, cjc_info.get('version', ''))
+
+        pkg = closest_packages[0]
+        cfgs.LOG.info(f"选择下载: {pkg['name']} (标签: {pkg['tag']})")
+
+        success = download_and_extract(pkg['url'], target_dir, logger=cfgs.LOG)
+
+        if success:
+            cfgs.LOG.info(f"stdx 下载并解压成功到: {target_dir}")
+            return True
+        else:
+            cfgs.LOG.error("stdx 下载失败")
+            return False
+
+    except Exception as e:
+        cfgs.LOG.error(f"下载 stdx 时发生错误: {e}")
+        return False
 
 
 def get_base_version(output: str) -> str:
@@ -748,26 +800,51 @@ def config_cjc(args):
                 targ_2 = targ.replace('llvm', "cjnative")
             else:
                 targ_2 = targ.replace("cjnative", 'llvm')
-            if not os.path.exists(os.path.join(Path(cfgs.WHICH_CJC).parent.parent, targ)) or not os.path.exists(os.path.join(Path(cfgs.WHICH_CJC).parent.parent, targ_2)):
+            if not os.path.exists(os.path.join(Path(cfgs.WHICH_CJC).parent.parent, targ)) or not os.path.exists(
+                    os.path.join(Path(cfgs.WHICH_CJC).parent.parent, targ_2)):
                 if hasattr(args, 'update_stdx') and args.update_stdx:
-                    cfgs.LOG.info("stdx文件夹不存在, 正在下载stdx: " + cfgs.get_stdx_url())
+                    cfgs.LOG.info("stdx文件夹不存在, 正在下载stdx...")
+
                     if not cfgs.IS_SELF_CONFIGURATION:
-                        stdx_zip_path = os.path.join(cfgs.cj_home, cfgs.BASE_CJC_VERSION, 'stdx.zip')
-                        stdx_zip_path_dirname = os.path.join(cfgs.cj_home, cfgs.BASE_CJC_VERSION)
+                        stdx_target_dir = os.path.join(cfgs.cj_home, cfgs.BASE_CJC_VERSION)
                     else:
-                        stdx_zip_path = os.path.join(cfgs.CANGJIE_HOME, 'stdx.zip')
-                        stdx_zip_path_dirname = cfgs.CANGJIE_HOME
-                    if not os.path.exists(stdx_zip_path):
-                        download_large_with_urllib(cfgs.get_stdx_url(), stdx_zip_path)
-                    if os.path.exists(stdx_zip_path):
-                        unzip_file(stdx_zip_path, stdx_zip_path_dirname)
-                        if os.path.exists(os.path.join(stdx_zip_path_dirname, targ)):
-                            shutil.copytree(os.path.join(stdx_zip_path_dirname, targ), os.path.join(stdx_zip_path_dirname, targ_2))
+                        stdx_target_dir = cfgs.CANGJIE_HOME
+
+                    download_success = download_stdx_with_new_tool(cfgs, stdx_target_dir)
+
+                    if download_success:
+                        if os.path.exists(os.path.join(stdx_target_dir, targ)):
+                            if not os.path.exists(os.path.join(stdx_target_dir, targ_2)):
+                                shutil.copytree(os.path.join(stdx_target_dir, targ),
+                                                os.path.join(stdx_target_dir, targ_2))
+                        elif os.path.exists(os.path.join(stdx_target_dir, targ_2)):
+                            if not os.path.exists(os.path.join(stdx_target_dir, targ)):
+                                shutil.copytree(os.path.join(stdx_target_dir, targ_2),
+                                                os.path.join(stdx_target_dir, targ))
                         else:
-                            shutil.copytree(os.path.join(stdx_zip_path_dirname, targ_2), os.path.join(stdx_zip_path_dirname, targ))
+                            cfgs.LOG.warn(f"下载的 stdx 包中未找到预期的目录: {targ} 或 {targ_2}")
                     else:
-                        cfgs.LOG.warn(f"stdx.zip不存在, 下载失败: {stdx_zip_path}")
-                        exit(1)
+                        cfgs.LOG.warn("stdx 下载失败，尝试使用备用方法...")
+                        cfgs.LOG.info("备用下载链接: " + cfgs.get_stdx_url())
+                        if not cfgs.IS_SELF_CONFIGURATION:
+                            stdx_zip_path = os.path.join(cfgs.cj_home, cfgs.BASE_CJC_VERSION, 'stdx.zip')
+                            stdx_zip_path_dirname = os.path.join(cfgs.cj_home, cfgs.BASE_CJC_VERSION)
+                        else:
+                            stdx_zip_path = os.path.join(cfgs.CANGJIE_HOME, 'stdx.zip')
+                            stdx_zip_path_dirname = cfgs.CANGJIE_HOME
+                        if not os.path.exists(stdx_zip_path):
+                            download_large_with_urllib(cfgs.get_stdx_url(), stdx_zip_path)
+                        if os.path.exists(stdx_zip_path):
+                            unzip_file(stdx_zip_path, stdx_zip_path_dirname)
+                            if os.path.exists(os.path.join(stdx_zip_path_dirname, targ)):
+                                shutil.copytree(os.path.join(stdx_zip_path_dirname, targ),
+                                                os.path.join(stdx_zip_path_dirname, targ_2))
+                            else:
+                                shutil.copytree(os.path.join(stdx_zip_path_dirname, targ_2),
+                                                os.path.join(stdx_zip_path_dirname, targ))
+                        else:
+                            cfgs.LOG.warn(f"stdx.zip不存在, 下载失败: {stdx_zip_path}")
+                            exit(1)
                 if not os.path.exists(os.path.join(Path(cfgs.WHICH_CJC).parent.parent, targ)):
                     cfgs.LOG.warn("stdx路径不存在: " + os.path.join(Path(cfgs.WHICH_CJC).parent.parent, targ))
             if os.path.exists(os.path.join(Path(cfgs.WHICH_CJC).parent.parent, targ)):
@@ -782,7 +859,8 @@ def config_cjc(args):
                                     os.path.join(Path(cfgs.WHICH_CJC).parent.parent, targ))
             else:
                 cfgs.LOG.warn("No STDX directory found.")
-            __set_cangjie_stdx_home(cfgs, cfgs.CANGJIE_STDX_DIR)
+            if cfgs.CANGJIE_STDX_DIR:
+                __set_cangjie_stdx_home(cfgs, cfgs.CANGJIE_STDX_DIR)
         else:
             cfgs.LOG.info(f"CANGJIE_STDX_DIR={cfgs.CANGJIE_STDX_DIR}")
     else:
@@ -993,7 +1071,8 @@ def __do_cjpm_build(args, cfgs):
         cmd1.append("--coverage")
     elif args.release:
         ci_test_cfg = cfgs.BUILD_PARMS
-        if 'profile' in ci_test_cfg and 'customized-option' in ci_test_cfg['profile'] and 'release' in ci_test_cfg['profile']['customized-option']:
+        if 'profile' in ci_test_cfg and 'customized-option' in ci_test_cfg['profile'] and 'release' in \
+                ci_test_cfg['profile']['customized-option']:
             cmd1.append("--release")
         else:
             if cfgs.UPDATE_CJPM_TOML or args.update_toml:
@@ -1288,7 +1367,6 @@ def compare_versions(v1: str, v2: str) -> int:
         ) from e
 
 
-
 def set_cangjie_home(cfgs, cjc_home):
     if cfgs.OS_PLATFORM == "windows":
         cfgs.LOG.info("The current environment is Windows")
@@ -1318,6 +1396,9 @@ def set_cangjie_home(cfgs, cjc_home):
 
 
 def __set_cangjie_stdx_home(cfgs, stdx_home):
+    if not stdx_home:
+        cfgs.LOG.warn("stdx_home is empty, skip setting cangjie stdx home.")
+        return
     if cfgs.OS_PLATFORM == "windows":
         cangjie_stdx_path = ""
         if stdx_home not in os.environ['Path']:
@@ -2192,8 +2273,8 @@ def get_cmd_info(file_name, target, cfgs):
                         for data in data_file_str.split(":"):
                             src = os.path.join(os.path.dirname(file_name), data)
                             dst = os.path.join(cfgs.HOME_DIR, cfgs.CJ_TEST_WORK, "tmp",
-                                            os.path.dirname(file_name).replace(cfgs.HOME_DIR,
-                                                                               "."), data)
+                                               os.path.dirname(file_name).replace(cfgs.HOME_DIR,
+                                                                                  "."), data)
                             os.makedirs(os.path.dirname(dst), exist_ok=True)
                             logger.info(f"copy {src} to {dst}")
                             if os.path.isdir(src):
