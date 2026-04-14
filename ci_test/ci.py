@@ -1729,7 +1729,9 @@ class ProcessLogger(threading.Thread):
                     time.sleep(0.1)
                     continue
                 if not llt_check_not_start_or_end_with_target(line):
-                    self.logger.info(line.decode('UTF-8', 'ignore').rstrip())
+                    msg = line.decode('UTF-8', 'ignore').rstrip()
+                    msg = msg.replace('\xa0', ' ').replace('\u00a0', ' ')
+                    self.logger.info(msg)
         except ValueError as e:
             if "info->buf must not be NULL" in str(e):
                 pass
