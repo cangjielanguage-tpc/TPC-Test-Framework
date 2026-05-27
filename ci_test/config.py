@@ -127,11 +127,18 @@ class ArgConfig:
                 self.OS_PLATFORM = None
         elif platform.system() == 'Windows':
             self.OS_PLATFORM = "windows"
+        elif platform.system() == 'Darwin':
+            if platform.uname().processor == "x86_64" or platform.uname().machine == "x86_64":
+                self.OS_PLATFORM = 'darwin_x86_64'
+            elif platform.uname().processor == "arm64" or platform.uname().machine == "arm64":
+                self.OS_PLATFORM = 'darwin_arm64'
+            else:
+                self.OS_PLATFORM = 'darwin_x86_64'
         else:
             self.OS_PLATFORM = None
         if self.OS_PLATFORM and self.OS_PLATFORM == "windows":
             self.LINE_SEPARATOR = "\r\n"
-        elif str(self.OS_PLATFORM).startswith("linux"):
+        elif str(self.OS_PLATFORM).startswith("linux") or str(self.OS_PLATFORM).startswith("darwin"):
             self.LINE_SEPARATOR = "\n"
         else:
             self.LINE_SEPARATOR = "\r"
@@ -149,6 +156,10 @@ class ArgConfig:
             return self.CANGJIE_STDX_DOWNLOAD_MAP[self.BASE_CJC_VERSION]["windows"]
         elif "aarch64" in self.CANGJIE_TARGET:
             return self.CANGJIE_STDX_DOWNLOAD_MAP[self.BASE_CJC_VERSION]["aarch64"]
+        elif "darwin" in self.CANGJIE_TARGET or "apple" in self.CANGJIE_TARGET:
+            if self.LOG:
+                self.LOG.warn("macOS 平台暂无官方 stdx 下载链接，尝试使用 Linux x86_64 版本")
+            return self.CANGJIE_STDX_DOWNLOAD_MAP[self.BASE_CJC_VERSION]["x86_64-unknown-linux-gnu"]
         return None
 
     def config_init(self):
@@ -202,6 +213,7 @@ class ArgConfig:
 
     def run_cmd(self, cmd, file_dir="./"):
         encode = 'gbk' if self.OS_PLATFORM == "windows" else "utf-8"
+        self.LOG.info("CMD    : %s", cmd)
         res = subprocess.Popen(cmd, shell=True, cwd=file_dir, stderr=subprocess.STDOUT, stdout=subprocess.PIPE)
         try:
             while res.poll() is None:
@@ -210,9 +222,8 @@ class ArgConfig:
                     if msg != "":
                         if not llt_check_not_start_or_end_with_target(msg):
                             self.LOG.info(msg)
-                res.kill()
         finally:
-            if res.poll():
+            if res.poll() is None:
                 res.kill()
         return res.returncode
 
