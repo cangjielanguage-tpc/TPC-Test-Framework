@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import platform
+import signal
 import shutil
 import subprocess
 import sys
@@ -649,6 +650,17 @@ def test(args):
     except:
         pass
     __find_cjpm_home_librarys(args, cfgs)
+
+    def signal_handler(sig, frame):
+        cfgs.LOG.info("\n收到中断信号，正在生成测试报告...")
+        try:
+            end_build(cfgs)
+        except Exception as e:
+            cfgs.LOG.error(f"生成报告时出错: {e}")
+        exit(1)
+
+    signal.signal(signal.SIGINT, signal_handler)
+
     runAll(args, cfgs)
     end_build(cfgs)
 
@@ -2798,7 +2810,7 @@ def collect_test_result(file_path, output, return_code, run_time):
             test_report["cases"][class_name] = []
             test_report["class_times"][class_name] = 0.0
 
-        test_report["cases"][class_name].append([file_name, status, run_time, error_trace, 0.0])
+        test_report["cases"][class_name].append([file_name, status, run_time, error_trace, 0.0, file_path])
         test_report["class_times"][class_name] += run_time
     else:
         # 使用测试框架的完整统计信息
@@ -2819,24 +2831,26 @@ def collect_test_result(file_path, output, return_code, run_time):
                 case_match = re.search(r"\[ PASSED \] CASE:\s*(\w+)", line)
                 if case_match:
                     case_name = case_match.group(1)
-                    test_report["cases"][class_name].append([case_name, "PASSED", run_time / total_cases, "", 0.0])
+                    test_report["cases"][class_name].append(
+                        [case_name, "PASSED", run_time / total_cases, "", 0.0, file_path])
             elif "[ FAILED ] CASE:" in line:
                 case_match = re.search(r"\[ FAILED \] CASE:\s*(\w+)", line)
                 if case_match:
                     case_name = case_match.group(1)
                     test_report["cases"][class_name].append(
-                        [case_name, "FAILED", run_time / total_cases, "Failed", 0.0])
+                        [case_name, "FAILED", run_time / total_cases, "Failed", 0.0, file_path])
             elif "[ ERROR ] CASE:" in line:
                 case_match = re.search(r"\[ ERROR \] CASE:\s*(\w+)", line)
                 if case_match:
                     case_name = case_match.group(1)
-                    test_report["cases"][class_name].append([case_name, "ERROR", run_time / total_cases, "Error", 0.0])
+                    test_report["cases"][class_name].append(
+                        [case_name, "ERROR", run_time / total_cases, "Error", 0.0, file_path])
             elif "[ SKIPPED ] CASE:" in line:
                 case_match = re.search(r"\[ SKIPPED \] CASE:\s*(\w+)", line)
                 if case_match:
                     case_name = case_match.group(1)
                     test_report["cases"][class_name].append(
-                        [case_name, "SKIPPED", run_time / total_cases, "Skipped", 0.0])
+                        [case_name, "SKIPPED", run_time / total_cases, "Skipped", 0.0, file_path])
 
         test_report["class_times"][class_name] += run_time
 
@@ -3198,11 +3212,16 @@ def gen_report_from_dict(cfgs):
     # 生成性能CSV报告
     with open(os.path.join(cfgs.HOME_DIR, cfgs.CJ_TEST_WORK, "report", "perf.csv"), "w+", encoding='UTF-8') as f:
         writer = csv.writer(f)
-        writer.writerow(["class", "case_name", "status", "case_time_elapsed(s)", "case_time_per_op(ns/op)"])
+        writer.writerow(
+            ["class", "case_name", "status", "case_time_elapsed(s)", "case_time_per_op(ns/op)", "file_path"])
         for class_name, cases in test_report["cases"].items():
             for case in cases:
-                case_name, status, case_time_elapsed, error_trace, case_time_per_op = case
-                writer.writerow([class_name, case_name, status, case_time_elapsed, case_time_per_op])
+                if len(case) >= 6:
+                    case_name, status, case_time_elapsed, error_trace, case_time_per_op, file_path = case[:6]
+                else:
+                    case_name, status, case_time_elapsed, error_trace, case_time_per_op = case[:5]
+                    file_path = ""
+                writer.writerow([class_name, case_name, status, case_time_elapsed, case_time_per_op, file_path])
 
     # 生成JUnit XML报告
     testsuites = Et.Element("testsuites")
@@ -3229,7 +3248,11 @@ def gen_report_from_dict(cfgs):
         class_skipped = 0
 
         for case in cases:
-            case_name, status, case_time_elapsed, error_trace, case_time_per_op = case
+            if len(case) >= 6:
+                case_name, status, case_time_elapsed, error_trace, case_time_per_op, file_path = case[:6]
+            else:
+                case_name, status, case_time_elapsed, error_trace, case_time_per_op = case[:5]
+                file_path = ""
             testcase = Et.SubElement(testsuite, "testcase",
                                      class_name=class_name,
                                      name=case_name,
@@ -3239,16 +3262,16 @@ def gen_report_from_dict(cfgs):
                 fail_info = Et.SubElement(testcase, "failure")
                 fail_info.text = error_trace
                 class_failures += 1
-                fail_list.append(f"{class_name}.{case_name}")
+                fail_list.append(file_path if file_path else f"{class_name}.{case_name}")
             elif "ERROR" in status:
                 error_info = Et.SubElement(testcase, "error")
                 error_info.text = error_trace
                 class_errors += 1
-                error_list.append(f"{class_name}.{case_name}")
+                error_list.append(file_path if file_path else f"{class_name}.{case_name}")
             elif "SKIP" in status:
                 Et.SubElement(testcase, "skipped")
                 class_skipped += 1
-                skip_list.append(f"{class_name}.{case_name}")
+                skip_list.append(file_path if file_path else f"{class_name}.{case_name}")
 
             class_total += 1
 
@@ -3307,11 +3330,6 @@ def HLTtest(args, cfgs):
         cfgs.IMPORT_PATH += f" --import-path {Path(cfgs.CANGJIE_STDX_DIR).parent}"
         cfgs.LIBRARY_PATH += f" -L {cfgs.CANGJIE_STDX_DIR}"
         __improt_stdx_libs([cfgs.CANGJIE_STDX_DIR], cfgs, args)
-    # if cfgs.BUILD_TYPE == "ci_test" and os.path.exists(
-    #         os.path.join(os.path.dirname(cfgs.HOME), "ci_bin", "libclang_rt.fuzzer_no_main.a")):
-    #     fuzz_lib = os.path.join(os.path.dirname(cfgs.HOME), "ci_bin", "libclang_rt.fuzzer_no_main.a")
-    # if cp.get("test", "fuzz_lib") != "":
-    #     fuzz_lib = cp.get("test", "fuzz_lib")
     _3rd_party_root = get_cjtest_path(args, cfgs, "")
     if _3rd_party_root == "":
         _3rd_party_root = Path(cfgs.HOME_DIR).parent
@@ -3406,6 +3424,16 @@ def HLTtest(args, cfgs):
 
     # 设置用例运行环境变量
     os.environ["ci_project_home"] = cfgs.HOME_DIR
+
+    def signal_handler(sig, frame):
+        logger.info("\n收到中断信号，正在生成测试报告...")
+        try:
+            gen_report(args, cfgs)
+        except Exception as e:
+            logger.error(f"生成报告时出错: {e}")
+        exit(1)
+
+    signal.signal(signal.SIGINT, signal_handler)
 
     for root, _, files in os.walk(dirs):
         for f in files:
