@@ -246,7 +246,9 @@ def parse_args(cfgs):
     if len(sys.argv) == 1:
         parser.print_help()
         sys.exit(1)
-    config_cjc(par)
+    # download 命令不需要 cjc 环境，跳过检查
+    if not (hasattr(par, 'func') and par.func.__name__ == 'download'):
+        config_cjc(par)
     try:
         par.func(par)
     except KeyboardInterrupt:
@@ -430,13 +432,14 @@ def download(args):
     if args.repo is None:
         args.repo = 'test4tpc'
     if args.bench is None:
-        args.bench = cfgs.MODULE_NAME if cfgs.MODULE_NAME else 'develop'
+        # 默认使用当前项目目录名作为分支名
+        args.bench = cfgs.MODULE_NAME if cfgs.MODULE_NAME else os.path.basename(cfgs.HOME_DIR)
     if args.depth is None:
         args.depth = 1
     if args.username is None and args.password is None:
         args.username = cfgs.GIT_USERNAME = get_config_value(cfgs.BUILD_CI_TEST_CFG, "git-config", "username")
         args.password = cfgs.GIT_PASSWORD = get_config_value(cfgs.BUILD_CI_TEST_CFG, "git-config", "password")
-    bigtest = ["compress4cj", "qrcode4cj", "mp3tag4cj", "xmpp4cj", "mp4parser4cj", "lottie4cj", "videocompress4cj"]
+    bigtest = ["compress4cj", "qrcode4cj", "mp3tag4cj", "mp4parser4cj", "lottie4cj", "videocompress4cj"]
     if args.bench in bigtest:
         args.repo = 'test4bigtpc'
     cfgs.LOG.info(f"owner={args.owner}, repo={args.repo}, bench={args.bench}, bench={args.bench}, depth={args.depth}")
@@ -574,20 +577,60 @@ def download(args):
     if os.path.exists(target_dir):
         if args.force:
             cfgs.LOG.info('正在删除test文件夹')
-            shutil.rmtree(os.path.join(cfgs.HOME_DIR, target_dir), ignore_errors=True)
+            # shutil.rmtree(os.path.join(cfgs.HOME_DIR, target_dir), ignore_errors=True)
         else:
             cfgs.LOG.error(f'{target_dir}文件夹已经存在.')
             raise Exception(f'{target_dir}文件夹已经存在.')
     possible_dirs = ['test', 'LLT', 'HLT']
     existing_dirs = []
-    for dir_name in possible_dirs:
-        source_dir = os.path.join(cfgs.HOME_DIR, clone_target_dir, dir_name)
-        if os.path.exists(source_dir):
-            existing_dirs.append((dir_name, source_dir))
-            cfgs.LOG.info(f"找到源文件夹：{source_dir}")
+    clone_base_dir = os.path.join(cfgs.HOME_DIR, clone_target_dir)
+
+    def find_test_dirs(base_dir, target_names, max_depth=2, current_depth=1):
+        """递归查找测试目录"""
+        found_dirs = []
+        if current_depth > max_depth:
+            return found_dirs
+
+        try:
+            for item in os.listdir(base_dir):
+                item_path = os.path.join(base_dir, item)
+                if os.path.isdir(item_path):
+                    if item in target_names:
+                        found_dirs.append((item, item_path))
+                        cfgs.LOG.info(f"找到源文件夹（深度{current_depth}）：{item_path}")
+                    # 无论是否找到目标目录，都继续递归查找子目录
+                    sub_found = find_test_dirs(item_path, target_names, max_depth, current_depth + 1)
+                    found_dirs.extend(sub_found)
+        except Exception as e:
+            cfgs.LOG.warning(f"遍历目录 {base_dir} 失败：{str(e)}")
+
+        return found_dirs
+
+    existing_dirs = find_test_dirs(clone_base_dir, possible_dirs, max_depth=2)
 
     if not existing_dirs:
-        raise FileNotFoundError(f"源文件夹不存在：{clone_target_dir} 下未找到 test/LLT/HLT 目录")
+        raise FileNotFoundError(f"源文件夹不存在：{clone_target_dir} 下未找到 test/LLT/HLT 目录（递归深度2）")
+
+    # 过滤结果：优先保留更深层次的匹配目录
+    # 如果某个目录的子目录也在匹配列表中，则跳过该目录（避免重复路径）
+    # 构建目录路径集合，用于检查子目录
+    source_dir_paths = {source_dir for dir_name, source_dir in existing_dirs}
+
+    filtered_dirs = []
+    for dir_name, source_dir in existing_dirs:
+        # 检查是否有子目录在匹配列表中
+        has_child_in_list = False
+        for other_name, other_path in existing_dirs:
+            # 如果 other_path 是 source_dir 的子目录
+            if other_path.startswith(source_dir + os.sep) and other_path != source_dir:
+                has_child_in_list = True
+                cfgs.LOG.info(f"跳过目录 {dir_name}（子目录 {other_name} 已在目标列表中）")
+                break
+
+        if not has_child_in_list:
+            filtered_dirs.append((dir_name, source_dir))
+
+    existing_dirs = filtered_dirs
 
     if not os.path.exists(target_dir):
         os.makedirs(target_dir)
@@ -595,8 +638,65 @@ def download(args):
 
     for dir_name, source_dir in existing_dirs:
         dest_dir = os.path.join(target_dir, dir_name)
-        cfgs.LOG.info(f"移动 {source_dir} -> {dest_dir}")
-        shutil.move(str(source_dir), str(dest_dir))
+        if os.path.exists(dest_dir):
+            cfgs.LOG.info(f"目标目录已存在，合并内容：{dest_dir}")
+            for item in os.listdir(source_dir):
+                src_item = os.path.join(source_dir, item)
+                dst_item = os.path.join(dest_dir, item)
+                if os.path.exists(dst_item):
+                    if os.path.isdir(dst_item):
+                        shutil.rmtree(dst_item, ignore_errors=True)
+                    else:
+                        os.remove(dst_item)
+                shutil.move(str(src_item), str(dst_item))
+                cfgs.LOG.info(f"移动 {src_item} -> {dst_item}")
+        else:
+            cfgs.LOG.info(f"移动 {source_dir} -> {dest_dir}")
+            shutil.move(str(source_dir), str(dest_dir))
+
+        # 检查同级是否有 resources 文件夹，如果有也复制
+        parent_dir = os.path.dirname(source_dir)
+        resources_dir = os.path.join(parent_dir, "resources")
+        if os.path.exists(resources_dir) and os.path.isdir(resources_dir):
+            resources_dest = os.path.join(target_dir, "resources")
+            if os.path.exists(resources_dest):
+                cfgs.LOG.info(f"目标 resources 目录已存在，合并内容：{resources_dest}")
+                for item in os.listdir(resources_dir):
+                    src_item = os.path.join(resources_dir, item)
+                    dst_item = os.path.join(resources_dest, item)
+                    if os.path.exists(dst_item):
+                        if os.path.isdir(dst_item):
+                            shutil.rmtree(dst_item, ignore_errors=True)
+                        else:
+                            os.remove(dst_item)
+                    shutil.move(str(src_item), str(dst_item))
+                    cfgs.LOG.info(f"移动 {src_item} -> {dst_item}")
+            else:
+                cfgs.LOG.info(f"移动 {resources_dir} -> {resources_dest}")
+                shutil.move(str(resources_dir), str(resources_dest))
+
+        # 检查同级是否有 LLT 文件夹，如果有且不在 existing_dirs 中，也复制
+        llt_dir = os.path.join(parent_dir, "LLT")
+        if os.path.exists(llt_dir) and os.path.isdir(llt_dir):
+            # 检查 LLT 是否已经在 existing_dirs 中
+            llt_in_existing = any(src == llt_dir for _, src in existing_dirs)
+            if not llt_in_existing:
+                llt_dest = os.path.join(target_dir, "LLT")
+                if os.path.exists(llt_dest):
+                    cfgs.LOG.info(f"目标 LLT 目录已存在，合并内容：{llt_dest}")
+                    for item in os.listdir(llt_dir):
+                        src_item = os.path.join(llt_dir, item)
+                        dst_item = os.path.join(llt_dest, item)
+                        if os.path.exists(dst_item):
+                            if os.path.isdir(dst_item):
+                                shutil.rmtree(dst_item, ignore_errors=True)
+                            else:
+                                os.remove(dst_item)
+                        shutil.move(str(src_item), str(dst_item))
+                        cfgs.LOG.info(f"移动 {src_item} -> {dst_item}")
+                else:
+                    cfgs.LOG.info(f"移动 {llt_dir} -> {llt_dest}")
+                    shutil.move(str(llt_dir), str(llt_dest))
 
     cfgs.LOG.info(f"清理临时：{os.path.join(cfgs.HOME_DIR, clone_target_dir)}")
     delete_path = str(os.path.join(cfgs.HOME_DIR, clone_target_dir))
@@ -892,6 +992,130 @@ def check_system_cjc(cfgs):
     return False, None
 
 
+def setup_stdx_if_needed(args, cfgs):
+    """
+    检查并设置 stdx 环境（如果需要）
+
+    Args:
+        args: 命令行参数
+        cfgs: 配置对象
+    """
+    if compare_versions(cfgs.BASE_CJC_VERSION, '0.61.0') >= 0:
+        if not cfgs.CANGJIE_STDX_DIR:
+            cfgs.LOG.info(f"仓颉版本:{cfgs.BASE_CJC_VERSION}, 需要检查stdx是否配置")
+            if cfgs.WHICH_CJC:
+                cfgs.IS_SELF_CONFIGURATION = True
+                cfgs.LOG.info("当前环境变量已经设置仓颉, 检查CANGJIE_HOME中是否存在stdx")
+            else:
+                cfgs.WHICH_CJC = shutil.which("cjc")
+                cfgs.LOG.info("未配置仓颉环境, 正在配置指定的路径的stdx")
+
+            # 获取 cjc 版本信息（如果还没有）
+            if cfgs.WHICH_CJC_OUT_STR is None:
+                cfgs.WHICH_CJC_OUT_STR = "".join(os.popen('{} -v'.format(shutil.which("cjc"))).readlines())
+                cfgs.LOG.info(cfgs.WHICH_CJC_OUT_STR)
+
+            if cfgs.CANGJIE_TARGET is None:
+                cfgs.CANGJIE_TARGET = cfgs.WHICH_CJC_OUT_STR.split('Target: ')[1].replace('\n', '').replace('\r', '')
+
+            # 确定 stdx 目录名称
+            if cfgs.CANGJIE_TARGET == "aarch64-linux-ohos":
+                targ = f"linux_ohos_aarch64_{cfgs.CJC_RUNTIME_SUFFIX}"
+            elif cfgs.CANGJIE_TARGET == "x86_64-linux-ohos":
+                targ = f"linux_ohos_x86_64_{cfgs.CJC_RUNTIME_SUFFIX}"
+            elif cfgs.CANGJIE_TARGET == "x86_64-unknown-linux-gnu":
+                targ = f"linux_x86_64_{cfgs.CJC_RUNTIME_SUFFIX}"
+            elif "darwin" in cfgs.CANGJIE_TARGET or "apple" in cfgs.CANGJIE_TARGET:
+                if "aarch64" in cfgs.CANGJIE_TARGET or "arm64" in cfgs.CANGJIE_TARGET:
+                    targ = f"darwin_arm64_{cfgs.CJC_RUNTIME_SUFFIX}"
+                else:
+                    targ = f"darwin_x86_64_{cfgs.CJC_RUNTIME_SUFFIX}"
+            elif "windows" in cfgs.CANGJIE_TARGET:
+                targ = f"windows_x86_64_{cfgs.CJC_RUNTIME_SUFFIX}"
+            elif "mingw32" in cfgs.CANGJIE_TARGET:
+                targ = f"windows_x86_64_{cfgs.CJC_RUNTIME_SUFFIX}"
+            elif "aarch64" in cfgs.CANGJIE_TARGET:
+                targ = f"linux_aarch64_{cfgs.CJC_RUNTIME_SUFFIX}"
+            else:
+                targ = "stdx"
+
+            if 'llvm' in targ:
+                targ_2 = targ.replace('llvm', "cjnative")
+            else:
+                targ_2 = targ.replace("cjnative", 'llvm')
+
+            # 检查 stdx 目录是否存在
+            stdx_base_path = Path(cfgs.WHICH_CJC).parent.parent
+            if not os.path.exists(os.path.join(stdx_base_path, targ)) or not os.path.exists(
+                    os.path.join(stdx_base_path, targ_2)):
+                if hasattr(args, 'update_stdx') and args.update_stdx:
+                    cfgs.LOG.info("stdx文件夹不存在, 正在下载stdx...")
+
+                    if not cfgs.IS_SELF_CONFIGURATION:
+                        stdx_target_dir = os.path.join(cfgs.cj_home, cfgs.BASE_CJC_VERSION)
+                    else:
+                        stdx_target_dir = cfgs.CANGJIE_HOME
+
+                    download_success = download_stdx_with_new_tool(cfgs, stdx_target_dir)
+
+                    if download_success:
+                        if os.path.exists(os.path.join(stdx_target_dir, targ)):
+                            if not os.path.exists(os.path.join(stdx_target_dir, targ_2)):
+                                shutil.copytree(os.path.join(stdx_target_dir, targ),
+                                                os.path.join(stdx_target_dir, targ_2))
+                        elif os.path.exists(os.path.join(stdx_target_dir, targ_2)):
+                            if not os.path.exists(os.path.join(stdx_target_dir, targ)):
+                                shutil.copytree(os.path.join(stdx_target_dir, targ_2),
+                                                os.path.join(stdx_target_dir, targ))
+                        else:
+                            cfgs.LOG.warn(f"下载的 stdx 包中未找到预期的目录: {targ} 或 {targ_2}")
+                    else:
+                        cfgs.LOG.warn("stdx 下载失败，尝试使用备用方法...")
+                        cfgs.LOG.info("备用下载链接: " + cfgs.get_stdx_url())
+                        if not cfgs.IS_SELF_CONFIGURATION:
+                            stdx_zip_path = os.path.join(cfgs.cj_home, cfgs.BASE_CJC_VERSION, 'stdx.zip')
+                            stdx_zip_path_dirname = os.path.join(cfgs.cj_home, cfgs.BASE_CJC_VERSION)
+                        else:
+                            stdx_zip_path = os.path.join(cfgs.CANGJIE_HOME, 'stdx.zip')
+                            stdx_zip_path_dirname = cfgs.CANGJIE_HOME
+                        if not os.path.exists(stdx_zip_path):
+                            download_large_with_urllib(cfgs.get_stdx_url(), stdx_zip_path)
+                        if os.path.exists(stdx_zip_path):
+                            unzip_file(stdx_zip_path, stdx_zip_path_dirname)
+                            if os.path.exists(os.path.join(stdx_zip_path_dirname, targ)):
+                                shutil.copytree(os.path.join(stdx_zip_path_dirname, targ),
+                                                os.path.join(stdx_zip_path_dirname, targ_2))
+                            else:
+                                shutil.copytree(os.path.join(stdx_zip_path_dirname, targ_2),
+                                                os.path.join(stdx_zip_path_dirname, targ))
+                        else:
+                            cfgs.LOG.warn(f"stdx.zip不存在, 下载失败: {stdx_zip_path}")
+                            exit(1)
+                if not os.path.exists(os.path.join(stdx_base_path, targ)):
+                    cfgs.LOG.warn("stdx路径不存在: " + os.path.join(stdx_base_path, targ))
+
+            # 设置 CANGJIE_STDX_DIR
+            if os.path.exists(os.path.join(stdx_base_path, targ)):
+                cfgs.CANGJIE_STDX_DIR = os.path.join(stdx_base_path, targ, "dynamic", "stdx")
+                if not os.path.exists(os.path.join(stdx_base_path, targ_2)):
+                    shutil.copytree(os.path.join(stdx_base_path, targ),
+                                    os.path.join(stdx_base_path, targ_2))
+            elif os.path.exists(os.path.join(stdx_base_path, targ_2)):
+                cfgs.CANGJIE_STDX_DIR = os.path.join(stdx_base_path, targ_2, "dynamic", "stdx")
+                if not os.path.exists(os.path.join(stdx_base_path, targ)):
+                    shutil.copytree(os.path.join(stdx_base_path, targ_2),
+                                    os.path.join(stdx_base_path, targ))
+            else:
+                cfgs.LOG.warn("No STDX directory found.")
+
+            if cfgs.CANGJIE_STDX_DIR:
+                __set_cangjie_stdx_home(cfgs, cfgs.CANGJIE_STDX_DIR)
+        else:
+            cfgs.LOG.info(f"CANGJIE_STDX_DIR={cfgs.CANGJIE_STDX_DIR}")
+    else:
+        cfgs.LOG.info("仓颉版本小于0.60.*")
+
+
 def find_cjc_in_cj_home(args, cfgs, expected_version):
     """
     从 args.cj_home 中查找对应版本的 cjc
@@ -998,6 +1222,8 @@ def config_cjc(args):
                     cfgs.set_build_bin("target")
                     cfgs.LIB_DIR = os.path.join(cfgs.HOME_DIR, "target")
 
+                # 检查并设置 stdx 环境
+                setup_stdx_if_needed(args, cfgs)
                 return
             else:
                 cfgs.LOG.warn(f"⚠️ 系统中的 cjc 版本 {system_version} 与期望版本 {expected_version} 不一致")
@@ -1016,6 +1242,8 @@ def config_cjc(args):
                     cfgs.set_build_bin("target")
                     cfgs.LIB_DIR = os.path.join(cfgs.HOME_DIR, "target")
 
+            # 检查并设置 stdx 环境
+            setup_stdx_if_needed(args, cfgs)
             return
 
     # 步骤5: 系统中没有 cjc 或版本不匹配，从 cj_home 中查找
@@ -1060,8 +1288,9 @@ def config_cjc(args):
         cfgs.LOG.info(f"已配置 cjc 版本: {actual_version}")
 
         # 设置环境变量
-        if not os.getenv('CANGJIE_STDX_PATH'):
-            os.environ['CANGJIE_STDX_PATH'] = os.environ['CANGJIE_HOME']
+        cangjie_home_env = os.getenv('CANGJIE_HOME')
+        if cangjie_home_env and not os.getenv('CANGJIE_STDX_PATH'):
+            os.environ['CANGJIE_STDX_PATH'] = cangjie_home_env
     else:
         # Mac 平台特殊处理：退出码 0
         if platform.system() == 'Darwin':
@@ -1086,104 +1315,9 @@ def config_cjc(args):
     else:
         cfgs.set_build_bin("target")
         cfgs.LIB_DIR = os.path.join(cfgs.HOME_DIR, "target")
-    if compare_versions(cfgs.BASE_CJC_VERSION, '0.61.0') >= 0:
-        if not cfgs.CANGJIE_STDX_DIR:
-            cfgs.LOG.info(f"仓颉版本:{cfgs.BASE_CJC_VERSION}, 需要检查stdx是否配置")
-            if cfgs.WHICH_CJC:
-                cfgs.IS_SELF_CONFIGURATION = True
-                cfgs.LOG.info("当前环境变量已经设置仓颉, 检查CANGJIE_HOME中是否存在stdx")
-            else:
-                cfgs.WHICH_CJC = shutil.which("cjc")
-                cfgs.LOG.info("未配置仓颉环境, 正在配置指定的路径的stdx")
-            if cfgs.CANGJIE_TARGET == "aarch64-linux-ohos":
-                targ = f"linux_ohos_aarch64_{cfgs.CJC_RUNTIME_SUFFIX}"
-            elif cfgs.CANGJIE_TARGET == "x86_64-linux-ohos":
-                targ = f"linux_ohos_x86_64_{cfgs.CJC_RUNTIME_SUFFIX}"
-            elif cfgs.CANGJIE_TARGET == "x86_64-unknown-linux-gnu":
-                targ = f"linux_x86_64_{cfgs.CJC_RUNTIME_SUFFIX}"
-            elif "darwin" in cfgs.CANGJIE_TARGET or "apple" in cfgs.CANGJIE_TARGET:
-                if "aarch64" in cfgs.CANGJIE_TARGET or "arm64" in cfgs.CANGJIE_TARGET:
-                    targ = f"darwin_arm64_{cfgs.CJC_RUNTIME_SUFFIX}"
-                else:
-                    targ = f"darwin_x86_64_{cfgs.CJC_RUNTIME_SUFFIX}"
-            elif "windows" in cfgs.CANGJIE_TARGET:
-                targ = f"windows_x86_64_{cfgs.CJC_RUNTIME_SUFFIX}"
-            elif "mingw32" in cfgs.CANGJIE_TARGET:
-                targ = f"windows_x86_64_{cfgs.CJC_RUNTIME_SUFFIX}"
-            elif "aarch64" in cfgs.CANGJIE_TARGET:
-                targ = f"linux_aarch64_{cfgs.CJC_RUNTIME_SUFFIX}"
-            else:
-                targ = "stdx"
-            if 'llvm' in targ:
-                targ_2 = targ.replace('llvm', "cjnative")
-            else:
-                targ_2 = targ.replace("cjnative", 'llvm')
 
-            if not os.path.exists(os.path.join(Path(cfgs.WHICH_CJC).parent.parent, targ)) or not os.path.exists(
-                    os.path.join(Path(cfgs.WHICH_CJC).parent.parent, targ_2)):
-                if hasattr(args, 'update_stdx') and args.update_stdx:
-                    cfgs.LOG.info("stdx文件夹不存在, 正在下载stdx...")
-
-                    if not cfgs.IS_SELF_CONFIGURATION:
-                        stdx_target_dir = os.path.join(cfgs.cj_home, cfgs.BASE_CJC_VERSION)
-                    else:
-                        stdx_target_dir = cfgs.CANGJIE_HOME
-
-                    download_success = download_stdx_with_new_tool(cfgs, stdx_target_dir)
-
-                    if download_success:
-                        if os.path.exists(os.path.join(stdx_target_dir, targ)):
-                            if not os.path.exists(os.path.join(stdx_target_dir, targ_2)):
-                                shutil.copytree(os.path.join(stdx_target_dir, targ),
-                                                os.path.join(stdx_target_dir, targ_2))
-                        elif os.path.exists(os.path.join(stdx_target_dir, targ_2)):
-                            if not os.path.exists(os.path.join(stdx_target_dir, targ)):
-                                shutil.copytree(os.path.join(stdx_target_dir, targ_2),
-                                                os.path.join(stdx_target_dir, targ))
-                        else:
-                            cfgs.LOG.warn(f"下载的 stdx 包中未找到预期的目录: {targ} 或 {targ_2}")
-                    else:
-                        cfgs.LOG.warn("stdx 下载失败，尝试使用备用方法...")
-                        cfgs.LOG.info("备用下载链接: " + cfgs.get_stdx_url())
-                        if not cfgs.IS_SELF_CONFIGURATION:
-                            stdx_zip_path = os.path.join(cfgs.cj_home, cfgs.BASE_CJC_VERSION, 'stdx.zip')
-                            stdx_zip_path_dirname = os.path.join(cfgs.cj_home, cfgs.BASE_CJC_VERSION)
-                        else:
-                            stdx_zip_path = os.path.join(cfgs.CANGJIE_HOME, 'stdx.zip')
-                            stdx_zip_path_dirname = cfgs.CANGJIE_HOME
-                        if not os.path.exists(stdx_zip_path):
-                            download_large_with_urllib(cfgs.get_stdx_url(), stdx_zip_path)
-                        if os.path.exists(stdx_zip_path):
-                            unzip_file(stdx_zip_path, stdx_zip_path_dirname)
-                            if os.path.exists(os.path.join(stdx_zip_path_dirname, targ)):
-                                shutil.copytree(os.path.join(stdx_zip_path_dirname, targ),
-                                                os.path.join(stdx_zip_path_dirname, targ_2))
-                            else:
-                                shutil.copytree(os.path.join(stdx_zip_path_dirname, targ_2),
-                                                os.path.join(stdx_zip_path_dirname, targ))
-                        else:
-                            cfgs.LOG.warn(f"stdx.zip不存在, 下载失败: {stdx_zip_path}")
-                            exit(1)
-                if not os.path.exists(os.path.join(Path(cfgs.WHICH_CJC).parent.parent, targ)):
-                    cfgs.LOG.warn("stdx路径不存在: " + os.path.join(Path(cfgs.WHICH_CJC).parent.parent, targ))
-            if os.path.exists(os.path.join(Path(cfgs.WHICH_CJC).parent.parent, targ)):
-                cfgs.CANGJIE_STDX_DIR = os.path.join(Path(cfgs.WHICH_CJC).parent.parent, targ, "dynamic", "stdx")
-                if not os.path.exists(os.path.join(Path(cfgs.WHICH_CJC).parent.parent, targ_2)):
-                    shutil.copytree(os.path.join(Path(cfgs.WHICH_CJC).parent.parent, targ),
-                                    os.path.join(Path(cfgs.WHICH_CJC).parent.parent, targ_2))
-            elif os.path.exists(os.path.join(Path(cfgs.WHICH_CJC).parent.parent, targ_2)):
-                cfgs.CANGJIE_STDX_DIR = os.path.join(Path(cfgs.WHICH_CJC).parent.parent, targ_2, "dynamic", "stdx")
-                if not os.path.exists(os.path.join(Path(cfgs.WHICH_CJC).parent.parent, targ)):
-                    shutil.copytree(os.path.join(Path(cfgs.WHICH_CJC).parent.parent, targ_2),
-                                    os.path.join(Path(cfgs.WHICH_CJC).parent.parent, targ))
-            else:
-                cfgs.LOG.warn("No STDX directory found.")
-            if cfgs.CANGJIE_STDX_DIR:
-                __set_cangjie_stdx_home(cfgs, cfgs.CANGJIE_STDX_DIR)
-        else:
-            cfgs.LOG.info(f"CANGJIE_STDX_DIR={cfgs.CANGJIE_STDX_DIR}")
-    else:
-        cfgs.LOG.info("仓颉版本小于0.60.*")
+    # 检查并设置 stdx 环境
+    setup_stdx_if_needed(args, cfgs)
 
 
 def init_log(cfgs, name, log_file_path=None):
@@ -1214,7 +1348,7 @@ def init_log(cfgs, name, log_file_path=None):
         log.info("CMD    : %s", " ".join(sys.argv))
     else:
         filehandler = TimedRotatingFileHandler(
-            os.path.join(log_path, "ci_test.log"), when="W6", interval=1, backupCount=60
+            os.path.join(log_path, "ci_test.log"), when="W6", interval=1, backupCount=60, encoding='utf-8'
         )
     filehandler.setLevel(logging.DEBUG)
     filehandler.setFormatter(formatter)
@@ -1294,8 +1428,25 @@ def __check_git_credentials():
         return False, f"检查Git凭证失败: {e}"
 
 
-def __get_git_clone_url(base_url: str) -> str:
-    """根据环境变量生成带认证的git clone URL"""
+def __get_git_clone_url(base_url: str, use_ssh: bool = False) -> str:
+    """根据环境变量生成带认证的git clone URL
+
+    Args:
+        base_url: 基础 URL
+        use_ssh: 是否使用 SSH 方式（Mac 环境默认使用 SSH）
+
+    Returns:
+        带认证的 URL 或 SSH URL
+    """
+    # Mac 环境优先使用 SSH 方式
+    if use_ssh or platform.system() == 'Darwin':
+        if base_url.startswith('https://'):
+            # 将 HTTPS URL 转换为 SSH URL
+            # https://gitcode.com/Cangjie-TPC/ci_lib.git -> git@gitcode.com:Cangjie-TPC/ci_lib.git
+            ssh_url = base_url.replace('https://', 'git@').replace('.com/', '.com:')
+            return ssh_url
+
+    # Windows/Linux 环境使用 HTTPS 方式
     gitcode_username = os.environ.get('gitcode_username', '')
     gitcode_password = os.environ.get('gitcode_password', '')
 
@@ -1560,23 +1711,46 @@ def __cjpm_git_download_toml(cfgs, sub_library, sub_library_config_file):
     name = parm['package']['name']
     gitee = "https://gitcode.com/Cangjie-TPC/ci_lib.git"
     gitee = __get_git_clone_url(gitee)
+    cfgs.LOG.info(
+        f"使用 Git URL: {gitee.replace(os.environ.get('gitcode_password', ''), '****') if os.environ.get('gitcode_password') else gitee}")
+
     for key, value in parm['ffi'].items():
         if key == "c":
             for ke, val in value.items():
                 for k, v in val.items():
                     if k == 'path':
-                        cmd0 = f"git clone -b lib_{name} {gitee} {os.path.join(cfgs.BASE_DIR, f'lib_{name}')} --depth=1"
+                        clone_dir = os.path.join(cfgs.BASE_DIR, f'lib_{name}')
+                        cmd0 = f"git clone -b lib_{name} {gitee} {clone_dir} --depth=1"
                         output = subprocess.Popen(cmd0, shell=True, cwd=cfgs.BASE_DIR, stderr=subprocess.PIPE,
                                                   stdout=subprocess.PIPE)
                         log_output(output, output.args, cfgs, cfgs.HOME_DIR)
+
+                        # 构建源目录路径
                         old_dir = os.path.join(cfgs.BASE_DIR, "lib_{}".format(name), cfgs.OS_PLATFORM, "lib",
                                                f"lib_{name}")
                         new_dir = os.path.join(sub_library, "lib")
+
+                        # 检查源目录是否存在
+                        if not os.path.exists(old_dir):
+                            cfgs.LOG.error(f"克隆的库目录不存在: {old_dir}")
+                            cfgs.LOG.error(f"请检查 ci_lib 仓库中是否存在分支: lib_{name}")
+                            cfgs.LOG.error(f"以及该分支下是否存在目录: {cfgs.OS_PLATFORM}/lib/lib_{name}")
+                            # 尝试列出克隆目录的内容以便调试
+                            if os.path.exists(clone_dir):
+                                cfgs.LOG.info(f"克隆目录 {clone_dir} 的内容:")
+                                for item in os.listdir(clone_dir):
+                                    cfgs.LOG.info(f"  - {item}")
+                            return
+
                         try:
                             shutil.copytree(old_dir, new_dir)
-                        except:
-                            shutil.rmtree(new_dir)
+                            cfgs.LOG.info(f"成功复制库文件: {old_dir} -> {new_dir}")
+                        except Exception as e:
+                            cfgs.LOG.warning(f"复制库文件失败，尝试清理后重试: {e}")
+                            if os.path.exists(new_dir):
+                                shutil.rmtree(new_dir)
                             shutil.copytree(old_dir, new_dir)
+                            cfgs.LOG.info(f"成功复制库文件: {old_dir} -> {new_dir}")
 
 
 def compare_versions(v1: str, v2: str) -> int:
@@ -1718,7 +1892,7 @@ def set_cangjie_home(cfgs, cjc_home):
             os.environ['CANGJIE_HOME'] = f"{cjc_home}"
         if not os.getenv('CANGJIE_STDX_PATH'):
             os.environ['CANGJIE_STDX_PATH'] = f"{cjc_home}"
-    elif cfgs.OS_PLATFORM.startswith("macos"):
+    elif cfgs.OS_PLATFORM.startswith("darwin"):
         cfgs.LOG.info("The current environment is Mac")
         cangjie_bin = os.path.join(cjc_home, 'bin')
         cangjie_tools = os.path.join(cjc_home, 'tools', 'bin')
@@ -2780,18 +2954,30 @@ def collect_test_result(file_path, output, return_code, run_time):
     # 如果没有找到摘要信息，使用单个用例的逻辑
     if total_cases == 0 and passed_cases == 0 and failed_cases == 0 and error_cases == 0 and skipped_cases == 0:
 
+        # 初始化默认值
+        status = "UNKNOWN"
+        error_trace = "-"
+
         # 检查测试框架的输出结果
         if "FAILED:" in output and "FAILED: 0" not in output:
             status = "FAILED"
+            error_trace = output if output else "-"
         elif "ERROR:" in output and "ERROR: 0" not in output:
             status = "ERROR"
+            error_trace = output if output else "-"
         elif "SKIPPED:" in output and "SKIPPED: 0" not in output:
             status = "SKIPPED"
+            error_trace = output if output else "-"
         elif "PASSED:" in output and "PASSED: 0" not in output:
             status = "PASSED"
+            error_trace = "-"
         elif return_code != 0:
             status = "FAILED"
             error_trace = output if output else f"Exit code: {return_code}"
+        else:
+            # 如果没有明确的输出信息且返回码为0，认为是通过
+            status = "PASSED"
+            error_trace = "-"
 
         # 更新全局报告
         test_report["total_cases"] += 1
