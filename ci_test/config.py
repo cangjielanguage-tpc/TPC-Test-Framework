@@ -112,6 +112,8 @@ class ArgConfig:
     WHICH_CJC = None
     WHICH_CJC_OUT_STR = None
     IS_SELF_CONFIGURATION = False
+    LOG_CMD = "simple"  # simple: 简化命令输出, full: 全量打印
+    SHOW_WARN = False   # 是否显示编译告警日志
 
     def __init__(self):
         master_cjc = shutil.which("cjc")
@@ -211,9 +213,30 @@ class ArgConfig:
         except FileNotFoundError:
             self.LOG.warn("未发现module.json文件")
 
+    def _simplify_cmd(self, cmd):
+        """简化命令输出，折叠 --import-path、-L、-l 等冗长参数"""
+        if self.LOG_CMD == "full":
+            return cmd
+        parts = cmd.split()
+        simplified = []
+        seen = {"--import-path": False, "-L": False, "-l": False}
+        i = 0
+        while i < len(parts):
+            part = parts[i]
+            if part in seen and i + 1 < len(parts):
+                if not seen[part]:
+                    count = parts.count(part)
+                    simplified.append(f"{part} ...({count}个)")
+                    seen[part] = True
+                i += 2  # skip the option value
+            else:
+                simplified.append(part)
+                i += 1
+        return " ".join(simplified)
+
     def run_cmd(self, cmd, file_dir="./"):
         encode = 'gbk' if self.OS_PLATFORM == "windows" else "utf-8"
-        self.LOG.info("CMD    : %s", cmd)
+        self.LOG.info("CMD    : %s", self._simplify_cmd(cmd))
         res = subprocess.Popen(cmd, shell=True, cwd=file_dir, stderr=subprocess.STDOUT, stdout=subprocess.PIPE)
         try:
             while res.poll() is None:

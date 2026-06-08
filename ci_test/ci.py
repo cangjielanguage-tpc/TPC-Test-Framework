@@ -68,6 +68,8 @@ def add_llt_common_arguments(parser):
     test_parser_path.add_argument("--clean", action='store_true', help="是否清空测试临时目录")
     test_parser_path.add_argument("-p", "--path", help="指定跑一个文件夹, 适用于在test/LLT文件夹多个文件夹方式")
     parser.add_argument("--log", help="指定日志输出文件路径，以追加形式写入")
+    parser.add_argument("--log-cmd", choices=["simple", "full"], default="simple",
+                        help="命令日志输出方式: simple=简化, full=全量")
     parser.set_defaults(func=test)
 
 
@@ -89,6 +91,8 @@ def add_hlt_common_arguments(cjtest_parser):
     cjtest_parser_branch.add_argument("--main", action='store_true', help="HLT用例测试方式")
     cjtest_parser_branch.add_argument("--fuzz", action='store_true', help="HLT用例测试方式")
     cjtest_parser.add_argument("--log", help="指定日志输出文件路径，以追加形式写入")
+    cjtest_parser.add_argument("--log-cmd", choices=["simple", "full"], default="simple",
+                               help="命令日志输出方式, simple: 简化输出, full: 全量打印")
 
 
 def __set_args_default_attribute(args, attr: str):
@@ -120,6 +124,8 @@ def set_args_default_attribute(args):
     __set_args_default_attribute(args, "update_stdx")
     __set_args_default_attribute(args, "update_toml")
     __set_args_default_attribute(args, "log")
+    __set_args_default_attribute(args, "log_cmd")
+    __set_args_default_attribute(args, "show_warn")
 
 
 def parse_args(cfgs):
@@ -153,6 +159,9 @@ def parse_args(cfgs):
     build_parser.add_argument("--debug", action='store_true', help="debug模式编译")
     build_parser.add_argument('--verbose', action='store_true', help="--verbose")
     build_parser.add_argument("--log", help="指定日志输出文件路径，以追加形式写入")
+    build_parser.add_argument("--log-cmd", choices=["simple", "full"], default="simple",
+                              help="命令日志输出方式, simple: 简化输出, full: 全量打印")
+    build_parser.add_argument("--show-warn", action='store_true', help="显示编译告警日志, 默认不显示")
     build_parser.set_defaults(func=build)
 
     build_parser = sub_parser.add_parser("download", help="下载测试仓库文件")
@@ -560,7 +569,39 @@ def download(args):
     if not clone_success:
         error_msg = f"仓库克隆失败！尝试了分支 '{args.bench}' 和 '{source_repo}' 都失败。\n{clone_error_msg}"
         cfgs.LOG.error(error_msg)
-        raise Exception(error_msg)
+
+        # 检查本地是否已存在测试文件
+        local_test_dir = os.path.join(cfgs.HOME_DIR, 'test')
+        hlt_dir = os.path.join(local_test_dir, 'HLT')
+        llt_dir = os.path.join(local_test_dir, 'LLT')
+
+        has_cj_files = False
+        cj_file_count = 0
+
+        # 检查 HLT 目录中的 .cj 文件
+        if os.path.exists(hlt_dir):
+            for root, dirs, files in os.walk(hlt_dir):
+                for f in files:
+                    if f.endswith('.cj'):
+                        has_cj_files = True
+                        cj_file_count += 1
+
+        # 检查 LLT 目录中的 .cj 文件
+        if os.path.exists(llt_dir):
+            for root, dirs, files in os.walk(llt_dir):
+                for f in files:
+                    if f.endswith('.cj'):
+                        has_cj_files = True
+                        cj_file_count += 1
+
+        if has_cj_files:
+            cfgs.LOG.warning(f"克隆失败，但本地已存在测试文件，跳过下载。")
+            cfgs.LOG.info(f"本地 test/HLT 和 test/LLT 目录中共有 {cj_file_count} 个 .cj 测试文件")
+            cfgs.LOG.info(f"HLT 目录: {hlt_dir} (存在: {os.path.exists(hlt_dir)})")
+            cfgs.LOG.info(f"LLT 目录: {llt_dir} (存在: {os.path.exists(llt_dir)})")
+            return 0
+        else:
+            raise Exception(error_msg)
 
     # 打印克隆后的目录列表
     try:
@@ -1178,6 +1219,14 @@ def config_cjc(args):
     3. 报错退出（Mac 平台特殊处理：退出码 0）
     """
     cfgs = args.CANGJIE_CI_TEST_CFGS
+
+    # 设置命令日志输出模式
+    if hasattr(args, 'log_cmd') and args.log_cmd:
+        cfgs.LOG_CMD = args.log_cmd
+
+    # 设置是否显示编译告警
+    if hasattr(args, 'show_warn'):
+        cfgs.SHOW_WARN = args.show_warn
 
     # 步骤1: 初始化配置
     cfgs.config_init()
@@ -2283,7 +2332,7 @@ class ProcessLogger(threading.Thread):
 
 def __log_output(output, cmd, cfgs, filename=None):
     """ log command output"""
-    cfgs.LOG.info("CMD    : %s", str(cmd))
+    cfgs.LOG.info("CMD    : %s", cfgs._simplify_cmd(str(cmd)))
     stdout, stderr = output.communicate()
     encode = cfgs.ENCODING
     error = stderr.decode(encode, "ignore").strip()
@@ -2292,7 +2341,8 @@ def __log_output(output, cmd, cfgs, filename=None):
         for item in re.split("\r?\n", error):
             item = re.sub(r"\x1b\[\d+m", "", item)
             if output.returncode == 0:
-                cfgs.LOG.warn(item)
+                if cfgs.SHOW_WARN:
+                    cfgs.LOG.warn(item)
             else:
                 cfgs.LOG.error(item)
     if out:
@@ -2303,7 +2353,7 @@ def __log_output(output, cmd, cfgs, filename=None):
 
 def log_output(proc, cmd, cfgs, filename=None):
     """ log command output"""
-    cfgs.LOG.info("CMD    : %s", str(cmd))
+    cfgs.LOG.info("CMD    : %s", cfgs._simplify_cmd(str(cmd)))
     stdout_logger = ProcessLogger(proc.stdout, cfgs.LOG, "")
     stderr_logger = ProcessLogger(proc.stderr, cfgs.LOG, "")
     stdout_logger.start()
@@ -2406,11 +2456,16 @@ def runOne(args, file, subcmd, cfgs):
                     cfgs.LOG.warn(f"无法复制文件： {copy_path}, 异常：{e}")
             else:
                 case_one_return_code = 0
+                # 根据 import 语句过滤需要链接的库（合并源码和测试用例的 import）
+                import_pkgs = parse_imports_from_case(file)
+                import_pkgs |= parse_imports_from_source(cfgs.HOME_DIR)
+                filtered_library = filter_library_by_imports(cfgs.LIBRARY, import_pkgs)
+                executed_cmds = set()  # 记录已执行的命令，避免重复执行和日志重复打印
                 for item in exec:
                     cmd_temp = item
                     cmd = form_line(item, {"import-path": cfgs.IMPORT_PATH})
                     cmd = form_line(cmd, {"L": cfgs.LIBRARY_PATH})
-                    cmd = form_line(cmd, {"l": cfgs.LIBRARY})
+                    cmd = form_line(cmd, {"l": filtered_library})
                     cmd = form_line(cmd, {"project-path": "--import-path {}".format(cfgs.HOME_DIR)})
                     cmd = form_line(cmd, {"project-L": "-L {}".format(cfgs.HOME_DIR)})
                     cmd = form_line(cmd, {"project": "{}".format(cfgs.HOME_DIR)})
@@ -2421,6 +2476,10 @@ def runOne(args, file, subcmd, cfgs):
                         cmd = form_line(cmd, {"f": path.name})
                     if "cjc" in cmd:
                         cmd = cmd + subcmd + args.optimize + cfgs.Woff
+                    # 去重：form_line 替换后相同的命令只执行一次
+                    if cmd in executed_cmds:
+                        continue
+                    executed_cmds.add(cmd)
                     output = subprocess.Popen(cmd, shell=True, cwd=runPath, stderr=subprocess.PIPE,
                                               stdout=subprocess.PIPE)
                     if platform.system() == 'Windows' and cmd != '.\\main.exe':
@@ -3043,6 +3102,110 @@ def collect_test_result(file_path, output, return_code, run_time):
     return "PASSED" if passed_cases == total_cases and failed_cases == 0 and error_cases == 0 else "FAILED"
 
 
+def __parse_import_line(line):
+    """解析单行 import 语句，提取包名
+    支持的语法形式：
+      import stdx.encoding.json.*              -> stdx.encoding.json
+      import stdx.encoding.json.{Class}        -> stdx.encoding.json
+      import stdx.encoding.json                -> stdx.encoding.json
+      import stdx.crypto.crypto.SecureRandom   -> stdx.crypto.crypto
+      protected import stdx.crypto.crypto.*     -> stdx.crypto.crypto
+    """
+    line = line.strip()
+    # 去掉修饰词（protected/open 等）
+    for modifier in ("protected ", "open ", "public ", "private ", "internal "):
+        if line.startswith(modifier):
+            line = line[len(modifier):].strip()
+            break
+    if not line.startswith("import "):
+        return None
+    pkg = line[len("import "):].strip().rstrip(";").strip()
+    # 去掉 .* 后缀
+    if pkg.endswith(".*"):
+        pkg = pkg[:-2]
+    # 去掉 .{xxx} 后缀
+    elif "." in pkg and pkg[-1] == "}":
+        idx = pkg.rfind(".{")
+        if idx > 0:
+            pkg = pkg[:idx]
+    # 去掉直接类名（如 import stdx.crypto.crypto.SecureRandom -> stdx.crypto.crypto）
+    # 类名首字母大写，包名首字母小写
+    parts = pkg.split(".")
+    if len(parts) > 1 and parts[-1][0].isupper():
+        pkg = ".".join(parts[:-1])
+    return pkg
+
+
+def parse_imports_from_case(file_path):
+    """解析测试用例文件中的 import 语句，返回导入的包名集合"""
+    import_pkgs = set()
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                pkg = __parse_import_line(line)
+                if pkg:
+                    import_pkgs.add(pkg)
+    except Exception:
+        pass
+    return import_pkgs
+
+
+def parse_imports_from_source(home_dir):
+    """扫描项目源码目录中的所有 .cj 文件，收集 import 语句，返回导入的包名集合"""
+    import_pkgs = set()
+    src_dir = os.path.join(home_dir, "src")
+    if not os.path.isdir(src_dir):
+        return import_pkgs
+    try:
+        for root, _, files in os.walk(src_dir):
+            for f in files:
+                if not f.endswith(".cj"):
+                    continue
+                file_path = os.path.join(root, f)
+                try:
+                    with open(file_path, "r", encoding="utf-8", errors="ignore") as fh:
+                        for line in fh:
+                            pkg = __parse_import_line(line)
+                            if pkg:
+                                import_pkgs.add(pkg)
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return import_pkgs
+
+
+def filter_library_by_imports(library_str, import_pkgs):
+    """根据 import 语句过滤 -l 库列表，只保留匹配的 stdx 库和非 stdx 库"""
+    if not import_pkgs:
+        return library_str
+    libs = library_str.split("-l ")
+    filtered = []
+    seen = set()  # 去重
+    for lib in libs:
+        lib = lib.strip()
+        if not lib:
+            continue
+        # 非 stdx 库始终保留（如 boundscheck, asn1, cangjie-dynamicLoader-opensslFFI 等）
+        if not lib.startswith("stdx."):
+            if lib not in seen:
+                seen.add(lib)
+                filtered.append(f"-l {lib}")
+            continue
+        # stdx 库：检查是否匹配任何 import 的前缀
+        matched = False
+        for pkg in import_pkgs:
+            # import stdx.encoding.json -> 匹配 stdx.encoding.json, stdx.encoding.json.stream 等
+            # import stdx.encoding -> 匹配 stdx.encoding, stdx.encoding.json, stdx.encoding.hex 等
+            if lib == pkg or lib.startswith(pkg + "."):
+                matched = True
+                break
+        if matched and lib not in seen:
+            seen.add(lib)
+            filtered.append(f"-l {lib}")
+    return " ".join(filtered) + " "
+
+
 def run_one_case(args, file_path, run_option, compile_option, target, cfgs):
     global error_count
     global total_count
@@ -3073,15 +3236,18 @@ def run_one_case(args, file_path, run_option, compile_option, target, cfgs):
                     break
                 shutil.copyfile(dll, os.path.join(case_dir, dll_name))
     out = os.path.join(case_dir, f"{file_name}.out")
+    # 根据 import 语句过滤需要链接的库（合并源码和测试用例的 import）
+    import_pkgs = parse_imports_from_case(file_path)
+    import_pkgs |= parse_imports_from_source(cfgs.HOME_DIR)
+    filtered_library = filter_library_by_imports(cfgs.LIBRARY, import_pkgs)
     # case_import_cmd = '" --import-path="'
     # case_library_path_L_cmd = " -L "
     compile_cmd = f'cjc {cfgs.Woff} {args.optimize} {macro_cmd} ' \
                   f'{cfgs.IMPORT_PATH} ' \
                   f'{cfgs.LIBRARY_PATH} ' \
-                  f'{cfgs.LIBRARY}' \
+                  f'{filtered_library}' \
                   f'{cfgs.library_l_cmd} ' \
                   f'{file_path} {dependence} -o {os.path.realpath(out)} {compile_option}'
-    logger.info(f"[Run CMD]{compile_cmd}")
 
     # 记录编译开始时间
     compile_start_time = time.time()
@@ -3117,7 +3283,6 @@ def run_one_case(args, file_path, run_option, compile_option, target, cfgs):
             run_case_cmd = f"cd {out_dir};DYLD_LIBRARY_PATH=\"{dyld_path}:$DYLD_LIBRARY_PATH\" ./{out_file} {run_option} {fuzz_cmd} -timeout=10800"
         else:  # windows
             run_case_cmd = f"cd {out_dir}&{out_file} {run_option} {fuzz_cmd}"
-    logger.info(f"[Run CMD]{run_case_cmd}")
 
     # 记录测试开始时间
     test_start_time = time.time()
@@ -3512,10 +3677,6 @@ def gen_report(args, cfgs):
 def HLTtest(args, cfgs):
     global _3rd_party_root
     global logger
-    if cfgs.CANGJIE_STDX_DIR:
-        cfgs.IMPORT_PATH += f" --import-path {Path(cfgs.CANGJIE_STDX_DIR).parent}"
-        cfgs.LIBRARY_PATH += f" -L {cfgs.CANGJIE_STDX_DIR}"
-        __improt_stdx_libs([cfgs.CANGJIE_STDX_DIR], cfgs, args)
     _3rd_party_root = get_cjtest_path(args, cfgs, "")
     if _3rd_party_root == "":
         _3rd_party_root = Path(cfgs.HOME_DIR).parent
