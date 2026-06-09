@@ -448,7 +448,7 @@ def download(args):
     if args.username is None and args.password is None:
         args.username = cfgs.GIT_USERNAME = get_config_value(cfgs.BUILD_CI_TEST_CFG, "git-config", "username")
         args.password = cfgs.GIT_PASSWORD = get_config_value(cfgs.BUILD_CI_TEST_CFG, "git-config", "password")
-    bigtest = ["compress4cj", "qrcode4cj", "mp3tag4cj", "mp4parser4cj", "lottie4cj", "videocompress4cj"]
+    bigtest = ["compress4cj", "qrcode4cj", "mp3tag4cj", "lottie4cj", "videocompress4cj"]
     if args.bench in bigtest:
         args.repo = 'test4bigtpc'
     cfgs.LOG.info(f"owner={args.owner}, repo={args.repo}, bench={args.bench}, bench={args.bench}, depth={args.depth}")
@@ -971,7 +971,9 @@ def get_base_version(output: str) -> str:
 
 def get_expected_cjc_version(cfgs):
     """
-    获取期望的 cjc 版本（优先级：cjpm.toml > module.json > README.md）
+    获取期望的 cjc 版本（优先级：README.md > cjpm.toml > module.json）
+
+    README.md 中的版本是最新版本，cjpm.toml/module.json 中的版本是最低兼容版本
 
     Args:
         cfgs: 配置对象
@@ -979,7 +981,16 @@ def get_expected_cjc_version(cfgs):
     Returns:
         str: 期望的 cjc 版本号，如果未找到返回 None
     """
-    # 优先从配置文件获取
+    # 优先从 README 文件获取最新版本
+    from config import find_readme_file, get_cjc_version_from_readme
+    readme_path = find_readme_file(cfgs.HOME_DIR)
+    if readme_path:
+        readme_version = get_cjc_version_from_readme(readme_path)
+        if readme_version:
+            cfgs.LOG.info(f"从 {os.path.basename(readme_path)} 获取到 cjc 最新版本: {readme_version}")
+            return readme_version
+
+    # 如果 README 文件中没有找到版本，则从配置文件获取最低兼容版本
     cfg = os.path.join(cfgs.HOME_DIR, cfgs.CONFIG_FILE)
     try:
         if str(cfgs.CONFIG_FILE).endswith('.toml'):
@@ -987,27 +998,17 @@ def get_expected_cjc_version(cfgs):
             if parm.get('package') is not None:
                 for key, value in parm['package'].items():
                     if key == "cjc-version":
+                        cfgs.LOG.info(f"从 cjpm.toml 获取到 cjc 最低兼容版本: {value}")
                         return value
         else:
             parm = json.load(open(cfg, 'r', encoding='UTF-8'))
             if 'cjc_version' in parm:
+                cfgs.LOG.info(f"从 module.json 获取到 cjc 最低兼容版本: {parm['cjc_version']}")
                 return parm['cjc_version']
     except:
-        cfgs.LOG.warn("本项目没有配置文件 module.json 或 cjpm.toml，尝试从 README.md 获取版本")
+        cfgs.LOG.warn("本项目没有配置文件 module.json 或 cjpm.toml")
 
-    # 从 README 文件获取版本（支持多种文件名格式）
-    readme_names = ['README.md', 'README.MD', 'README', 'readme.md', 'Readme.md']
-    for readme_name in readme_names:
-        readme_path = os.path.join(cfgs.HOME_DIR, readme_name)
-        if os.path.exists(readme_path):
-            try:
-                version = get_cjc_version(readme_path)
-                if version:
-                    return version
-            except:
-                continue
-
-    cfgs.LOG.warn("无法从 README 文件获取 cjc 版本")
+    cfgs.LOG.warn("无法获取 cjc 版本信息")
 
     return None
 
@@ -1015,6 +1016,11 @@ def get_expected_cjc_version(cfgs):
 def check_system_cjc(cfgs):
     """
     检查系统中是否有 cjc 环境
+    支持多种检测方式：
+    1. shutil.which("cjc")
+    2. 直接执行 cjc -v 命令
+    3. 检查 CANGJIE_ROOT 环境变量
+    4. 检查常见安装路径
 
     Args:
         cfgs: 配置对象
@@ -1022,14 +1028,61 @@ def check_system_cjc(cfgs):
     Returns:
         tuple: (是否有 cjc, cjc 版本号)
     """
+    # 方法1: 使用 shutil.which 检查
     master_cjc = shutil.which("cjc")
     if master_cjc:
         try:
             output = os.popen('{} -v'.format(master_cjc)).read()
             version = get_base_version(output)
+            cfgs.LOG.info(f"通过 which 找到 cjc: {master_cjc} (版本: {version})")
             return True, version
         except:
+            cfgs.LOG.warn(f"找到 cjc 但无法获取版本: {master_cjc}")
             return True, None
+
+    # 方法2: 直接尝试执行 cjc -v（可能 cjc 在 PATH 中但 which 找不到）
+    try:
+        output = os.popen('cjc -v').read()
+        if output and 'Cangjie Compiler' in output:
+            version = get_base_version(output)
+            cfgs.LOG.info(f"通过直接执行找到 cjc (版本: {version})")
+            return True, version
+    except:
+        pass
+
+    # 方法3: 检查 CANGJIE_ROOT 环境变量
+    cangjie_root = os.environ.get('CANGJIE_ROOT')
+    if cangjie_root:
+        cjc_path = os.path.join(cangjie_root, 'bin', 'cjc')
+        if os.path.exists(cjc_path):
+            try:
+                output = os.popen('{} -v'.format(cjc_path)).read()
+                version = get_base_version(output)
+                cfgs.LOG.info(f"通过 CANGJIE_ROOT 找到 cjc: {cjc_path} (版本: {version})")
+                return True, version
+            except:
+                cfgs.LOG.warn(f"通过 CANGJIE_ROOT 找到 cjc 但无法获取版本: {cjc_path}")
+                return True, None
+
+    # 方法4: 检查常见安装路径
+    common_paths = [
+        '/usr/local/bin/cjc',
+        '/usr/bin/cjc',
+        os.path.join(os.environ.get('HOME', ''), '.cangjie', 'bin', 'cjc'),
+    ]
+
+    for cjc_path in common_paths:
+        if os.path.exists(cjc_path):
+            try:
+                output = os.popen('{} -v'.format(cjc_path)).read()
+                if output and 'Cangjie Compiler' in output:
+                    version = get_base_version(output)
+                    cfgs.LOG.info(f"通过常见路径找到 cjc: {cjc_path} (版本: {version})")
+                    return True, version
+            except:
+                continue
+
+    cfgs.LOG.info("系统中未找到 cjc 环境")
     return False, None
 
 
@@ -1276,7 +1329,52 @@ def config_cjc(args):
                 return
             else:
                 cfgs.LOG.warn(f"⚠️ 系统中的 cjc 版本 {system_version} 与期望版本 {expected_version} 不一致")
-                # 继续尝试从 cj_home 中找期望版本
+                # 尝试从 cj_home 中找期望版本，如果找不到则使用系统的 cjc
+                args.cj_home = os.environ.get('CANGJIE_ROOT', get_cangjie_path(cfgs, 'home'))
+                if args.cj_home:
+                    # 从 cj_home 中查找对应版本
+                    cjc_home = find_cjc_in_cj_home(args, cfgs, expected_version)
+                    if cjc_home:
+                        # 找到期望版本，使用 cj_home 中的版本
+                        actual_version = os.path.basename(cjc_home)
+                        cfgs.BASE_CJC_VERSION = actual_version
+                        cfgs.cj_home = args.cj_home
+
+                        # 设置运行时后缀
+                        if compare_versions(actual_version, '1.0.4') > 0:
+                            cfgs.CJC_RUNTIME_SUFFIX = 'cjnative'
+
+                        # 设置 cangjie 环境
+                        set_cangjie_home(cfgs, cjc_home)
+
+                        # 设置 build_bin 和 LIB_DIR
+                        if compare_versions(actual_version, '0.49.0') < 0:
+                            cfgs.set_build_bin("build")
+                            cfgs.LIB_DIR = os.path.join(cfgs.HOME_DIR, "build")
+                        else:
+                            cfgs.set_build_bin("target")
+                            cfgs.LIB_DIR = os.path.join(cfgs.HOME_DIR, "target")
+
+                        cfgs.LOG.info(f"已配置 cjc 版本: {actual_version}")
+                        setup_stdx_if_needed(args, cfgs)
+                        return
+
+                # cj_home 中未找到期望版本，使用系统的 cjc
+                cfgs.LOG.warn(f"使用系统中的 cjc 版本 {system_version}（未找到期望版本 {expected_version}）")
+                cfgs.WHICH_CJC = shutil.which("cjc")
+                cfgs.BASE_CJC_VERSION = system_version
+
+                # 设置 build_bin 和 LIB_DIR
+                if compare_versions(system_version, '0.49.0') < 0:
+                    cfgs.set_build_bin("build")
+                    cfgs.LIB_DIR = os.path.join(cfgs.HOME_DIR, "build")
+                else:
+                    cfgs.set_build_bin("target")
+                    cfgs.LIB_DIR = os.path.join(cfgs.HOME_DIR, "target")
+
+                # 检查并设置 stdx 环境
+                setup_stdx_if_needed(args, cfgs)
+                return
         else:
             cfgs.LOG.info("系统中已配置 cjc 环境")
             cfgs.WHICH_CJC = shutil.which("cjc")
@@ -1295,8 +1393,8 @@ def config_cjc(args):
             setup_stdx_if_needed(args, cfgs)
             return
 
-    # 步骤5: 系统中没有 cjc 或版本不匹配，从 cj_home 中查找
-    cfgs.LOG.info("系统中未找到匹配的 cjc，尝试从 cj_home 中查找...")
+    # 步骤5: 系统中没有 cjc，从 cj_home 中查找
+    cfgs.LOG.info("系统中未找到 cjc，尝试从 cj_home 中查找...")
 
     # 获取 cj_home 路径
     try:
@@ -1754,6 +1852,21 @@ def __cjpm_git_download_json(cfgs, sub_library, sub_library_config_file):
                     shutil.copytree(old_dir, new_dir)
 
 
+def __get_cjpm_target_from_os_platform(cfgs):
+    """
+    将 cfgs.OS_PLATFORM 映射到 cjpm.toml 中的 target 格式
+    例如: linux_x86_64 -> x86_64-unknown-linux-gnu
+    """
+    platform_mapping = {
+        'linux_x86_64': 'x86_64-unknown-linux-gnu',
+        'linux_aarch64': 'aarch64-unknown-linux-gnu',
+        'windows': 'x86_64-unknown-windows-gnu',
+        'darwin_x86_64': 'x86_64-apple-darwin',
+        'darwin_arm64': 'aarch64-apple-darwin'
+    }
+    return platform_mapping.get(cfgs.OS_PLATFORM)
+
+
 def __cjpm_git_download_toml(cfgs, sub_library, sub_library_config_file):
     cfgs.LOG.info(f"check file {sub_library_config_file}")
     parm = parse(open(sub_library_config_file, "r", encoding='UTF-8').read())
@@ -1763,43 +1876,98 @@ def __cjpm_git_download_toml(cfgs, sub_library, sub_library_config_file):
     cfgs.LOG.info(
         f"使用 Git URL: {gitee.replace(os.environ.get('gitcode_password', ''), '****') if os.environ.get('gitcode_password') else gitee}")
 
-    for key, value in parm['ffi'].items():
-        if key == "c":
-            for ke, val in value.items():
-                for k, v in val.items():
-                    if k == 'path':
-                        clone_dir = os.path.join(cfgs.BASE_DIR, f'lib_{name}')
-                        cmd0 = f"git clone -b lib_{name} {gitee} {clone_dir} --depth=1"
-                        output = subprocess.Popen(cmd0, shell=True, cwd=cfgs.BASE_DIR, stderr=subprocess.PIPE,
-                                                  stdout=subprocess.PIPE)
-                        log_output(output, output.args, cfgs, cfgs.HOME_DIR)
+    # 检查是否存在旧格式的 ffi.c 配置（且不为空）
+    has_ffi_c = 'ffi' in parm and 'c' in parm['ffi'] and len(parm['ffi']['c']) > 0
+    cfgs.LOG.info(f"检测到旧格式 ffi.c 配置: {has_ffi_c}")
 
-                        # 构建源目录路径
-                        old_dir = os.path.join(cfgs.BASE_DIR, "lib_{}".format(name), cfgs.OS_PLATFORM, "lib",
-                                               f"lib_{name}")
-                        new_dir = os.path.join(sub_library, "lib")
+    # 检查是否存在新格式的 target.<platform>.ffi.c 配置
+    has_target_ffi_c = False
+    target_ffi_c_config = None
+    if 'target' in parm:
+        current_target = __get_cjpm_target_from_os_platform(cfgs)
+        cfgs.LOG.info(f"当前平台 target: {current_target}")
+        if current_target and current_target in parm['target']:
+            target_config = parm['target'][current_target]
+            if 'ffi' in target_config and 'c' in target_config['ffi']:
+                has_target_ffi_c = True
+                target_ffi_c_config = target_config['ffi']['c']
+                cfgs.LOG.info(f"检测到新格式 target.{current_target}.ffi.c 配置: {target_ffi_c_config}")
 
-                        # 检查源目录是否存在
-                        if not os.path.exists(old_dir):
-                            cfgs.LOG.error(f"克隆的库目录不存在: {old_dir}")
-                            cfgs.LOG.error(f"请检查 ci_lib 仓库中是否存在分支: lib_{name}")
-                            cfgs.LOG.error(f"以及该分支下是否存在目录: {cfgs.OS_PLATFORM}/lib/lib_{name}")
-                            # 尝试列出克隆目录的内容以便调试
-                            if os.path.exists(clone_dir):
-                                cfgs.LOG.info(f"克隆目录 {clone_dir} 的内容:")
-                                for item in os.listdir(clone_dir):
-                                    cfgs.LOG.info(f"  - {item}")
-                            return
+    # 处理旧格式 ffi.c
+    if has_ffi_c:
+        for ke, val in parm['ffi']['c'].items():
+            for k, v in val.items():
+                if k == 'path':
+                    clone_dir = os.path.join(cfgs.BASE_DIR, f'lib_{name}')
+                    cmd0 = f"git clone -b lib_{name} {gitee} {clone_dir} --depth=1"
+                    output = subprocess.Popen(cmd0, shell=True, cwd=cfgs.BASE_DIR, stderr=subprocess.PIPE,
+                                              stdout=subprocess.PIPE)
+                    log_output(output, output.args, cfgs, cfgs.HOME_DIR)
 
-                        try:
-                            shutil.copytree(old_dir, new_dir)
-                            cfgs.LOG.info(f"成功复制库文件: {old_dir} -> {new_dir}")
-                        except Exception as e:
-                            cfgs.LOG.warning(f"复制库文件失败，尝试清理后重试: {e}")
-                            if os.path.exists(new_dir):
-                                shutil.rmtree(new_dir)
-                            shutil.copytree(old_dir, new_dir)
-                            cfgs.LOG.info(f"成功复制库文件: {old_dir} -> {new_dir}")
+                    # 构建源目录路径
+                    old_dir = os.path.join(cfgs.BASE_DIR, "lib_{}".format(name), cfgs.OS_PLATFORM, "lib",
+                                           f"lib_{name}")
+                    new_dir = os.path.join(sub_library, "lib")
+
+                    # 检查源目录是否存在
+                    if not os.path.exists(old_dir):
+                        cfgs.LOG.error(f"克隆的库目录不存在: {old_dir}")
+                        cfgs.LOG.error(f"请检查 ci_lib 仓库中是否存在分支: lib_{name}")
+                        cfgs.LOG.error(f"以及该分支下是否存在目录: {cfgs.OS_PLATFORM}/lib/lib_{name}")
+                        # 尝试列出克隆目录的内容以便调试
+                        if os.path.exists(clone_dir):
+                            cfgs.LOG.info(f"克隆目录 {clone_dir} 的内容:")
+                            for item in os.listdir(clone_dir):
+                                cfgs.LOG.info(f"  - {item}")
+                        return
+
+                    try:
+                        shutil.copytree(old_dir, new_dir)
+                        cfgs.LOG.info(f"成功复制库文件: {old_dir} -> {new_dir}")
+                    except Exception as e:
+                        cfgs.LOG.warning(f"复制库文件失败，尝试清理后重试: {e}")
+                        if os.path.exists(new_dir):
+                            shutil.rmtree(new_dir)
+                        shutil.copytree(old_dir, new_dir)
+                        cfgs.LOG.info(f"成功复制库文件: {old_dir} -> {new_dir}")
+
+    # 处理新格式 target.<platform>.ffi.c
+    elif has_target_ffi_c:
+        for ke, val in target_ffi_c_config.items():
+            for k, v in val.items():
+                if k == 'path':
+                    clone_dir = os.path.join(cfgs.BASE_DIR, f'lib_{name}')
+                    cmd0 = f"git clone -b lib_{name} {gitee} {clone_dir} --depth=1"
+                    output = subprocess.Popen(cmd0, shell=True, cwd=cfgs.BASE_DIR, stderr=subprocess.PIPE,
+                                              stdout=subprocess.PIPE)
+                    log_output(output, output.args, cfgs, cfgs.HOME_DIR)
+
+                    # 构建源目录路径
+                    old_dir = os.path.join(cfgs.BASE_DIR, "lib_{}".format(name), cfgs.OS_PLATFORM, "lib",
+                                           f"lib_{name}")
+                    new_dir = os.path.join(sub_library, "lib")
+
+                    # 检查源目录是否存在
+                    if not os.path.exists(old_dir):
+                        cfgs.LOG.error(f"克隆的库目录不存在: {old_dir}")
+                        cfgs.LOG.error(f"请检查 ci_lib 仓库中是否存在分支: lib_{name}")
+                        cfgs.LOG.error(f"以及该分支下是否存在目录: {cfgs.OS_PLATFORM}/lib/lib_{name}")
+                        # 尝试列出克隆目录的内容以便调试
+                        if os.path.exists(clone_dir):
+                            cfgs.LOG.info(f"克隆目录 {clone_dir} 的内容:")
+                            for item in os.listdir(clone_dir):
+                                cfgs.LOG.info(f"  - {item}")
+                        return
+
+                    try:
+                        shutil.copytree(old_dir, new_dir)
+                        cfgs.LOG.info(f"成功复制库文件: {old_dir} -> {new_dir}")
+                    except Exception as e:
+                        cfgs.LOG.warning(f"复制库文件失败，尝试清理后重试: {e}")
+                        if os.path.exists(new_dir):
+                            shutil.rmtree(new_dir)
+                        shutil.copytree(old_dir, new_dir)
+                        cfgs.LOG.info(f"成功复制库文件: {old_dir} -> {new_dir}")
 
 
 def compare_versions(v1: str, v2: str) -> int:
@@ -1970,6 +2138,21 @@ def __set_cangjie_stdx_home(cfgs, stdx_home):
     if not stdx_home:
         cfgs.LOG.warn("stdx_home is empty, skip setting cangjie stdx home.")
         return
+
+    # 设置 CANGJIE_STDX_PATH 环境变量（cjpm 需要这个环境变量）
+    cangjie_home_env = os.getenv('CANGJIE_HOME')
+    if not cangjie_home_env:
+        # 如果 CANGJIE_HOME 环境变量不存在，根据 cjc 路径推断
+        if cfgs.WHICH_CJC:
+            cangjie_home_env = os.path.dirname(os.path.dirname(cfgs.WHICH_CJC))
+            os.environ['CANGJIE_HOME'] = cangjie_home_env
+            cfgs.LOG.info(f"根据 cjc 路径推断并设置 CANGJIE_HOME: {cangjie_home_env}")
+
+    if cangjie_home_env and not os.getenv('CANGJIE_STDX_PATH'):
+        os.environ['CANGJIE_STDX_PATH'] = cangjie_home_env
+        cfgs.LOG.info(f"设置 CANGJIE_STDX_PATH 环境变量: {cangjie_home_env}")
+
+    # 设置库路径环境变量
     if cfgs.OS_PLATFORM == "windows":
         cangjie_stdx_path = ""
         if stdx_home not in os.environ['Path']:
@@ -2459,7 +2642,7 @@ def runOne(args, file, subcmd, cfgs):
                 # 根据 import 语句过滤需要链接的库（合并源码和测试用例的 import）
                 import_pkgs = parse_imports_from_case(file)
                 import_pkgs |= parse_imports_from_source(cfgs.HOME_DIR)
-                filtered_library = filter_library_by_imports(cfgs.LIBRARY, import_pkgs)
+                filtered_library = filter_library_by_imports(cfgs.LIBRARY, import_pkgs, cfgs.HOME_DIR)
                 executed_cmds = set()  # 记录已执行的命令，避免重复执行和日志重复打印
                 for item in exec:
                     cmd_temp = item
@@ -3175,34 +3358,124 @@ def parse_imports_from_source(home_dir):
     return import_pkgs
 
 
-def filter_library_by_imports(library_str, import_pkgs):
-    """根据 import 语句过滤 -l 库列表，只保留匹配的 stdx 库和非 stdx 库"""
+def load_dep_cache(home_dir):
+    """加载 .dep-cache 文件，返回依赖映射字典"""
+    dep_cache_path = os.path.join(home_dir, "target", ".dep-cache")
+    if not os.path.exists(dep_cache_path):
+        return None
+
+    try:
+        with open(dep_cache_path, "r", encoding="utf-8") as f:
+            dep_cache = json.load(f)
+        return dep_cache
+    except Exception as e:
+        return None
+
+
+def get_transitive_dependencies(dep_cache, package_name, visited=None):
+    """递归获取包的所有传递依赖（包括隐式依赖）
+
+    Args:
+        dep_cache: .dep-cache 文件内容
+        package_name: 包名，如 "stdx.encoding.json"
+        visited: 已访问的包集合，防止循环依赖
+
+    Returns:
+        所有依赖包名的集合（包括传递依赖）
+    """
+    if visited is None:
+        visited = set()
+
+    if package_name in visited:
+        return set()
+
+    visited.add(package_name)
+    all_deps = set()
+
+    if not dep_cache:
+        return all_deps
+
+    # 查找匹配的条目（包括 "bin" 和 "pkg-build" 部分）
+    sections = ["bin", "pkg-build"]
+    for section in sections:
+        if section not in dep_cache:
+            continue
+
+        for cjo_path, cjo_info in dep_cache[section].items():
+            if cjo_info.get("package") == package_name:
+                # 获取直接依赖
+                dependencies = cjo_info.get("dependencies", [])
+                for dep in dependencies:
+                    dep_pkg = dep.get("package", "")
+                    if dep_pkg and not dep.get("isStd", False):
+                        all_deps.add(dep_pkg)
+                        # 递归获取传递依赖
+                        transitive_deps = get_transitive_dependencies(dep_cache, dep_pkg, visited)
+                        all_deps.update(transitive_deps)
+                break
+
+    return all_deps
+
+
+def filter_library_by_imports(library_str, import_pkgs, home_dir=None):
+    """根据 import 语句过滤 -l 库列表，只保留匹配的 stdx 库和非 stdx 库
+
+    Args:
+        library_str: 库字符串，如 "-l stdx.encoding.json -l boundscheck"
+        import_pkgs: import 的包名集合
+        home_dir: 项目根目录，用于查找 .dep-cache 文件
+
+    Returns:
+        过滤后的库字符串
+    """
     if not import_pkgs:
         return library_str
+
+    # 加载依赖缓存
+    dep_cache = None
+    if home_dir:
+        dep_cache = load_dep_cache(home_dir)
+
     libs = library_str.split("-l ")
     filtered = []
     seen = set()  # 去重
+    implicit_deps = set()  # 收集隐式依赖
+
+    # 第一遍：收集所有匹配的库和它们的隐式依赖
     for lib in libs:
         lib = lib.strip()
         if not lib:
             continue
-        # 非 stdx 库始终保留（如 boundscheck, asn1, cangjie-dynamicLoader-opensslFFI 等）
+
+        # 判断是否应该包含这个库
+        should_include = False
+
+        # 非 stdx 库始终保留（如 boundscheck, asn1, cangjie-dynamicLoader-opensslFFI, httpclient4cj 等）
         if not lib.startswith("stdx."):
-            if lib not in seen:
-                seen.add(lib)
-                filtered.append(f"-l {lib}")
-            continue
-        # stdx 库：检查是否匹配任何 import 的前缀
-        matched = False
-        for pkg in import_pkgs:
-            # import stdx.encoding.json -> 匹配 stdx.encoding.json, stdx.encoding.json.stream 等
-            # import stdx.encoding -> 匹配 stdx.encoding, stdx.encoding.json, stdx.encoding.hex 等
-            if lib == pkg or lib.startswith(pkg + "."):
-                matched = True
-                break
-        if matched and lib not in seen:
+            should_include = True
+        else:
+            # stdx 库：检查是否匹配任何 import 的前缀
+            for pkg in import_pkgs:
+                # import stdx.encoding.json -> 匹配 stdx.encoding.json, stdx.encoding.json.stream 等
+                # import stdx.encoding -> 匹配 stdx.encoding, stdx.encoding.json, stdx.encoding.hex 等
+                if lib == pkg or lib.startswith(pkg + "."):
+                    should_include = True
+                    break
+
+        if should_include and lib not in seen:
             seen.add(lib)
             filtered.append(f"-l {lib}")
+            # 收集隐式依赖（对所有库都收集，包括非 stdx 库）
+            if dep_cache:
+                trans_deps = get_transitive_dependencies(dep_cache, lib)
+                implicit_deps.update(trans_deps)
+
+    # 第二遍：添加隐式依赖
+    for implicit_dep in implicit_deps:
+        if implicit_dep not in seen:
+            seen.add(implicit_dep)
+            filtered.append(f"-l {implicit_dep}")
+
     return " ".join(filtered) + " "
 
 
@@ -3239,7 +3512,7 @@ def run_one_case(args, file_path, run_option, compile_option, target, cfgs):
     # 根据 import 语句过滤需要链接的库（合并源码和测试用例的 import）
     import_pkgs = parse_imports_from_case(file_path)
     import_pkgs |= parse_imports_from_source(cfgs.HOME_DIR)
-    filtered_library = filter_library_by_imports(cfgs.LIBRARY, import_pkgs)
+    filtered_library = filter_library_by_imports(cfgs.LIBRARY, import_pkgs, cfgs.HOME_DIR)
     # case_import_cmd = '" --import-path="'
     # case_library_path_L_cmd = " -L "
     compile_cmd = f'cjc {cfgs.Woff} {args.optimize} {macro_cmd} ' \
