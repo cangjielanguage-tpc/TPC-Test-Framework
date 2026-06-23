@@ -2642,6 +2642,19 @@ def runOne(args, file, subcmd, cfgs):
                 # 根据 import 语句过滤需要链接的库（合并源码和测试用例的 import）
                 import_pkgs = parse_imports_from_case(file)
                 import_pkgs |= parse_imports_from_source(cfgs.HOME_DIR)
+                # 解析 DEPENDENCE 文件中的 import 语句
+                for dep_file in copy:
+                    if dep_file == path.name:  # 跳过主测试文件
+                        continue
+                    try:
+                        dep_path = path.parent
+                        items = dep_file.split('/')
+                        for sps in items:
+                            dep_path = os.path.join(dep_path, sps)
+                        if os.path.isfile(dep_path):
+                            import_pkgs |= parse_imports_from_case(dep_path)
+                    except Exception:
+                        pass
                 filtered_library = filter_library_by_imports(cfgs.LIBRARY, import_pkgs, cfgs.HOME_DIR)
                 executed_cmds = set()  # 记录已执行的命令，避免重复执行和日志重复打印
                 for item in exec:
@@ -3078,6 +3091,9 @@ def get_cmd_info(file_name, target, cfgs):
                                                                                   "."), data)
                             os.makedirs(os.path.dirname(dst), exist_ok=True)
                             logger.info(f"copy {src} to {dst}")
+                            if not os.path.exists(src):
+                                logger.warning(f"data_file source not found, skip: {src}")
+                                continue
                             if os.path.isdir(src):
                                 try:
                                     shutil.copytree(src, dst)
@@ -3112,6 +3128,9 @@ def get_cmd_info(file_name, target, cfgs):
                                                                                                    ".")), data)
                                 logger.info(f"copy {src} to {dst}")
                                 os.makedirs(os.path.dirname(dst), exist_ok=True)
+                                if not os.path.exists(src):
+                                    logger.warning(f"sources_file source not found, skip: {src}")
+                                    continue
                                 if os.path.isdir(src):
                                     shutil.copytree(src, dst)
                                 else:
@@ -3436,10 +3455,50 @@ def filter_library_by_imports(library_str, import_pkgs, home_dir=None):
     if home_dir:
         dep_cache = load_dep_cache(home_dir)
 
+    def lib_name_to_pkg_name(lib_name):
+        """将库名转换为包名
+
+        对于宏包，库名是 -macro_<package_name>，需要去掉 -macro_ 前缀
+        对于普通包，库名就是 <package_name>
+        库名中的 @ 分隔符需要转换为 :: 格式，与 import 语句中的包名格式一致
+        例如: zlib4cj@cangjie_tpc -> cangjie_tpc::zlib4cj
+        """
+        if lib_name.startswith("-macro_"):
+            lib_name = lib_name[7:]  # 去掉 "-macro_" 前缀
+        # 将库名中的 @ 分隔符转换为 :: 格式，与 import 语句和 dep-cache 中的包名格式一致
+        if "@" in lib_name:
+            parts = lib_name.split("@")
+            if len(parts) == 2:
+                return f"{parts[1]}::{parts[0]}"
+        return lib_name
+
+    def is_macro_package(pkg_name):
+        """检查包是否是宏包"""
+        if not dep_cache:
+            return False
+        sections = ["bin", "pkg-build"]
+        for section in sections:
+            if section not in dep_cache:
+                continue
+            for cjo_path, cjo_info in dep_cache[section].items():
+                if cjo_info.get("package") == pkg_name:
+                    return cjo_info.get("isMacro", False)
+        return False
+
     libs = library_str.split("-l ")
     filtered = []
     seen = set()  # 去重
     implicit_deps = set()  # 收集隐式依赖
+
+    # 预处理：识别所有宏包，并记录它们的库名
+    macro_libs = {}  # {pkg_name: lib_name}
+    for lib in libs:
+        lib = lib.strip()
+        if not lib:
+            continue
+        pkg_name = lib_name_to_pkg_name(lib)
+        if is_macro_package(pkg_name):
+            macro_libs[pkg_name] = lib
 
     # 第一遍：收集所有匹配的库和它们的隐式依赖
     for lib in libs:
@@ -3450,9 +3509,27 @@ def filter_library_by_imports(library_str, import_pkgs, home_dir=None):
         # 判断是否应该包含这个库
         should_include = False
 
-        # 非 stdx 库始终保留（如 boundscheck, asn1, cangjie-dynamicLoader-opensslFFI, httpclient4cj 等）
+        # 非 stdx 库：检查是否有依赖关系
         if not lib.startswith("stdx."):
-            should_include = True
+            # 将库名转换为包名
+            pkg_name = lib_name_to_pkg_name(lib)
+
+            # 如果这个包是宏包，检查是否已经有宏版本的库
+            if pkg_name in macro_libs:
+                # 如果当前库不是宏版本，跳过
+                if not lib.startswith("-macro_"):
+                    continue
+
+            # 检查这个库是否在 import 列表中，或者是某个 import 的依赖
+            if pkg_name in import_pkgs:
+                should_include = True
+            elif dep_cache:
+                # 检查这个库是否是某个 import 包的依赖
+                for pkg in import_pkgs:
+                    trans_deps = get_transitive_dependencies(dep_cache, pkg)
+                    if pkg_name in trans_deps:
+                        should_include = True
+                        break
         else:
             # stdx 库：检查是否匹配任何 import 的前缀
             for pkg in import_pkgs:
@@ -3467,14 +3544,26 @@ def filter_library_by_imports(library_str, import_pkgs, home_dir=None):
             filtered.append(f"-l {lib}")
             # 收集隐式依赖（对所有库都收集，包括非 stdx 库）
             if dep_cache:
-                trans_deps = get_transitive_dependencies(dep_cache, lib)
+                pkg_name = lib_name_to_pkg_name(lib)
+                trans_deps = get_transitive_dependencies(dep_cache, pkg_name)
                 implicit_deps.update(trans_deps)
 
     # 第二遍：添加隐式依赖
     for implicit_dep in implicit_deps:
-        if implicit_dep not in seen:
-            seen.add(implicit_dep)
-            filtered.append(f"-l {implicit_dep}")
+        # 检查是否是宏包，如果是，添加 -macro_ 前缀
+        if dep_cache:
+            is_macro = is_macro_package(implicit_dep)
+            if is_macro:
+                lib_name = f"-macro_{implicit_dep}"
+            else:
+                lib_name = implicit_dep
+        else:
+            lib_name = implicit_dep
+
+        # 去重检查
+        if lib_name not in seen:
+            seen.add(lib_name)
+            filtered.append(f"-l {lib_name}")
 
     return " ".join(filtered) + " "
 
@@ -3747,12 +3836,12 @@ def gen_junit_report(cfgs, cases, tcs_time):
     for tcs in cases.keys():
         class_name = tcs
         testsuite = Et.SubElement(testsuites, "testsuite", name=class_name,
-                                  time=str(tcs_time[tcs] / 1000 / 1000 / 1000))
+                                  time=str(tcs_time[tcs]))
         tcs_info[tcs] = [0, 0, 0, 0, 0]
         for case in cases[tcs]:
             case_name, status, case_time_elapsed, error_trace, case_time_per_op = case
             testcase = Et.SubElement(testsuite, "testcase", class_name=class_name, name=case_name,
-                                     time=str(case_time_elapsed / 1000 / 1000 / 1000))
+                                     time=str(case_time_elapsed))
             if "FAILED" in status:
                 fail_info = Et.SubElement(testcase, "failure")
                 fail_info.text = error_trace
@@ -3837,7 +3926,7 @@ def gen_report_from_dict(cfgs):
     with open(os.path.join(cfgs.HOME_DIR, cfgs.CJ_TEST_WORK, "report", "perf.csv"), "w+", encoding='UTF-8') as f:
         writer = csv.writer(f)
         writer.writerow(
-            ["class", "case_name", "status", "case_time_elapsed(s)", "case_time_per_op(ns/op)", "file_path"])
+            ["class", "case_name", "status", "case_time_elapsed(ns)", "case_time_per_op(ns/op)", "file_path"])
         for class_name, cases in test_report["cases"].items():
             for case in cases:
                 if len(case) >= 6:
