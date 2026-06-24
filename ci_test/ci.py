@@ -2353,6 +2353,252 @@ def get_config_value(config, section, option, default=None):
         return default
 
 
+_case_config_cache = {}
+
+
+def load_case_config(case_file_path, cfgs):
+    """从用例文件所在目录开始向上查找 case_config.cfg 并加载
+
+    配置文件支持以下配置项:
+        [skip] - 屏蔽用例
+            cases = case1, case2  (用例文件名，不含.cj后缀，逗号分隔)
+        [pre_setup] - 用例执行前运行脚本
+            case1 = ./setup.sh     (脚本路径相对于case_config.cfg所在目录)
+        [post_teardown] - 用例执行后运行脚本
+            case1 = ./cleanup.sh
+
+    Returns:
+        (config, config_dir) 元组，config 为 ConfigParser 对象或 None，
+        config_dir 为配置文件所在目录或 None
+    """
+    case_dir = os.path.dirname(os.path.abspath(case_file_path))
+
+    if case_dir in _case_config_cache:
+        return _case_config_cache[case_dir]
+
+    test_root = os.path.join(cfgs.HOME_DIR, cfgs.CJ_TEST_WORK)
+    current = case_dir
+    config = None
+    config_dir = None
+
+    while current:
+        config_path = os.path.join(current, "case_config.cfg")
+        if os.path.exists(config_path):
+            config = read_config(Path(config_path))
+            config_dir = current
+            break
+        if os.path.abspath(current) == os.path.abspath(test_root):
+            break
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+
+    result = (config, config_dir) if config else (None, None)
+    _case_config_cache[case_dir] = result
+    return result
+
+
+def find_case_config(test_dir):
+    """在 test_dir 及其子目录中递归查找 case_config.cfg，返回找到的第一个路径"""
+    config_path = os.path.join(test_dir, "case_config.cfg")
+    if os.path.exists(config_path):
+        return config_path
+    for root, _, files in os.walk(test_dir):
+        if "case_config.cfg" in files:
+            return os.path.join(root, "case_config.cfg")
+    return None
+
+
+def run_global_script(cfgs, test_dir, section, log=None):
+    """执行全局前置/后置脚本
+
+    Args:
+        cfgs: 配置对象
+        test_dir: 测试目录(如 test/LLT)
+        section: 配置段名 "global_setup" 或 "global_teardown"
+        log: 日志对象，为 None 时使用 cfgs.LOG
+    """
+    logger = log or cfgs.LOG
+    config_path = find_case_config(test_dir)
+    if not config_path:
+        return
+    config = read_config(Path(config_path))
+    if not config:
+        return
+    if not config.has_section(section):
+        return
+    script = config.get(section, "script", fallback="").strip()
+    if not script:
+        return
+    config_dir = os.path.dirname(config_path)
+    script_path = script if os.path.isabs(script) else os.path.join(config_dir, script)
+    logger.info(f"执行全局{section}脚本: {script_path}")
+    result = subprocess.run(script_path, shell=True, cwd=config_dir)
+    if result.returncode != 0:
+        logger.warning(f"全局{section}脚本执行失败(返回码:{result.returncode})")
+
+
+def setup_external_libs(cfgs, test_dir, log=None):
+    """从 case_config.cfg 读取 [external_libs] 段，下载第三方动态库并添加到链接路径
+
+    支持 git、url 和 cjpm 三种方式:
+        mylib = git:https://example.com/repo.git,master
+        mylib2 = url:https://example.com/libmylib.so
+        mylib3 = cjpm:https://gitcode.com/Cangjie-TPC/somelib.git,master,src/image
+
+    下载后的库存放在 test/libs/ 目录下，自动将 .so/.a/.dylib/.dll 添加到 -L 和 -l
+    对于 cjpm 类型，会自动执行 cjpm build 编译并清理旧预编译产物
+    """
+    logger = log or cfgs.LOG
+    config_path = find_case_config(test_dir)
+    if not config_path:
+        return
+    config = read_config(Path(config_path))
+    if not config or not config.has_section("external_libs"):
+        return
+
+    libs_dir = os.path.join(cfgs.HOME_DIR, cfgs.CJ_TEST_WORK, "libs")
+    os.makedirs(libs_dir, exist_ok=True)
+
+    for lib_key in config.options("external_libs"):
+        value = config.get("external_libs", lib_key).strip()
+        if not value:
+            continue
+        lib_dest = os.path.join(libs_dir, lib_key)
+        cjpm_build_success = False
+        cjpm_target_dir = None
+        if value.startswith("cjpm:"):
+            # cjpm 类型：需要用当前 cjc 版本重新编译，即使目录已存在也只跳过 clone 不跳过 build
+            parts = value[5:].split(",", 2)
+            git_url = parts[0].strip()
+            branch = parts[1].strip() if len(parts) > 1 else "master"
+            subdir = parts[2].strip() if len(parts) > 2 else ""
+            if os.path.exists(lib_dest):
+                logger.info(f"第三方库 {lib_key} 已存在，跳过克隆，需要重新编译")
+            else:
+                logger.info(f"git clone {git_url} (branch={branch}) -> {lib_dest}")
+                clone_cmd = f"git clone -b {branch} --depth=1 {git_url} {lib_dest}"
+                clone_result = subprocess.run(clone_cmd, shell=True, capture_output=True, text=True)
+                if clone_result.returncode != 0:
+                    logger.warning(f"git clone 失败: {clone_result.stderr.strip()}")
+                    continue
+            build_cwd = os.path.join(lib_dest, subdir) if subdir else lib_dest
+            # 如果指定的 subdir 不存在，自动搜索含 cjpm.toml 或 module.json 的目录作为编译目录
+            if not os.path.isdir(build_cwd) and os.path.isdir(lib_dest):
+                logger.info(f"配置的子目录 {build_cwd} 不存在，正在自动搜索 cjpm 项目目录")
+                for item in os.listdir(lib_dest):
+                    item_path = os.path.join(lib_dest, item)
+                    if os.path.isdir(item_path):
+                        if os.path.isfile(os.path.join(item_path, "cjpm.toml")) or \
+                           os.path.isfile(os.path.join(item_path, "module.json")):
+                            build_cwd = item_path
+                            logger.info(f"找到 cjpm 项目目录: {build_cwd}")
+                            break
+            if not os.path.isdir(build_cwd):
+                logger.warning(f"编译目录不存在: {build_cwd}，跳过 cjpm build，使用仓库中已有产物")
+            else:
+                logger.info(f"cjpm build {build_cwd}")
+                build_cmd = "cjpm update && cjpm build"
+                build_result = subprocess.run(build_cmd, shell=True, cwd=build_cwd, capture_output=True, text=True)
+                if build_result.returncode != 0:
+                    logger.warning(f"cjpm build 失败: {build_result.stderr.strip()}")
+                else:
+                    logger.info(f"cjpm build 完成")
+                    cjpm_build_success = True
+                    cjpm_target_dir = os.path.abspath(os.path.join(build_cwd, "target"))
+                    # cjpm build 成功后，清理旧预编译产物(.cjo/.bchir2/.so/.dll/.dylib/.a/.lib)
+                    # 避免 .cjo 版本不兼容和重复链接，仅保留 target/ 下的新构建产物和根目录的本地原生库
+                    lib_dest_abs = os.path.abspath(lib_dest)
+                    for dirpath, dirnames, filenames in os.walk(lib_dest):
+                        abs_dirpath = os.path.abspath(dirpath)
+                        # 跳过新构建产物目录
+                        if abs_dirpath.startswith(cjpm_target_dir):
+                            continue
+                        # 跳过根目录（保留原生 C 库如 crypto, ssl）
+                        if abs_dirpath == lib_dest_abs:
+                            continue
+                        for f in filenames:
+                            ext = pathlib.Path(f).suffix.lower()
+                            if ext in {".cjo", ".bchir2", ".so", ".dll", ".dylib", ".a", ".lib"}:
+                                old_file = os.path.join(dirpath, f)
+                                try:
+                                    os.remove(old_file)
+                                except OSError:
+                                    pass
+        elif os.path.exists(lib_dest):
+            logger.info(f"第三方库 {lib_key} 已存在，跳过下载")
+        elif value.startswith("git:"):
+            parts = value[4:].split(",", 1)
+            git_url = parts[0].strip()
+            branch = parts[1].strip() if len(parts) > 1 else "master"
+            logger.info(f"git clone {git_url} (branch={branch}) -> {lib_dest}")
+            clone_cmd = f"git clone -b {branch} --depth=1 {git_url} {lib_dest}"
+            clone_result = subprocess.run(clone_cmd, shell=True, capture_output=True, text=True)
+            if clone_result.returncode != 0:
+                logger.warning(f"git clone 失败: {clone_result.stderr.strip()}")
+                continue
+        elif value.startswith("url:"):
+            url = value[4:].strip()
+            logger.info(f"下载 {url} -> {lib_dest}")
+            os.makedirs(lib_dest, exist_ok=True)
+            filename = url.split("/")[-1].split("?")[0]
+            save_path = os.path.join(lib_dest, filename)
+            try:
+                download_large_with_urllib(url, save_path)
+                if filename.endswith(".zip"):
+                    unzip_file(save_path, lib_dest)
+                    os.remove(save_path)
+            except Exception as e:
+                logger.warning(f"下载失败: {e}")
+                continue
+        else:
+            logger.warning(f"未知的第三方库配置格式: {value}")
+            continue
+
+        # 扫描下载的目录，找到库文件并添加到链接路径
+        # cjpm 构建的库：只扫描 target/ 目录（cjpm 已处理原生 C 库依赖）
+        # 其他类型：扫描整个目录
+        scan_dir = cjpm_target_dir if cjpm_build_success else lib_dest
+        lib_exts = {".so", ".a", ".dylib", ".dll", ".lib"}
+        import_dirs = set()
+        for dirpath, _, filenames in os.walk(scan_dir):
+            for f in filenames:
+                ext = pathlib.Path(f).suffix.lower()
+                # .cjo 文件: 添加其所在目录的父目录到 --import-path
+                if ext == ".cjo":
+                    cjo_dir = os.path.abspath(dirpath)
+                    parent_dir = os.path.dirname(cjo_dir)
+                    if parent_dir not in import_dirs:
+                        import_dirs.add(parent_dir)
+                        cfgs.IMPORT_PATH += f" --import-path {parent_dir}"
+                        logger.info(f"添加第三方包导入路径: --import-path {parent_dir}")
+                    continue
+                if ext not in lib_exts:
+                    continue
+                dir_abs = os.path.abspath(dirpath)
+                if dir_abs not in cfgs.LIBRARY_PATH:
+                    cfgs.LIBRARY_PATH += f" -L {dir_abs}"
+                base = os.path.splitext(f)[0]
+                if base.lower().startswith("lib"):
+                    base = base[3:]
+                if f"-l {base} " not in cfgs.LIBRARY + " ":
+                    cfgs.LIBRARY += f"-l {base} "
+                    logger.info(f"添加第三方库: -L {dir_abs} -l {base}")
+        # 设置运行时库搜索路径：cjpm 构建传 .so 所在目录，其他类型传 lib_dest
+        if cjpm_build_success and cjpm_target_dir:
+            # 收集 target/ 下所有包含 .so 文件的目录，加入 LD_LIBRARY_PATH
+            so_dirs = []
+            for so_dirpath, _, so_filenames in os.walk(cjpm_target_dir):
+                for so_f in so_filenames:
+                    if pathlib.Path(so_f).suffix.lower() == ".so":
+                        so_dirs.append(so_dirpath)
+                        break
+            cangjie_env_setup(so_dirs)
+        else:
+            cangjie_env_setup([lib_dest])
+
+
 def form_line(line, obj):
     for key, value in obj.items():
         end = 0
@@ -2578,7 +2824,10 @@ def runAll(args, cfgs):
         cfgs.LIBRARY_PATH += f" -L {cfgs.CANGJIE_STDX_DIR}"
         __improt_stdx_libs([cfgs.CANGJIE_STDX_DIR], cfgs, args)
     __improt_libs(find_cangjie_lib_arr, cfgs)
+    setup_external_libs(cfgs, cfgs.TEST_DIR)
+    run_global_script(cfgs, cfgs.TEST_DIR, "global_setup")
     loop_dir(args, cfgs, lambda file: runOne(args, file, subcmd, cfgs))
+    run_global_script(cfgs, cfgs.TEST_DIR, "global_teardown")
 
 
 def runOne(args, file, subcmd, cfgs):
@@ -2588,6 +2837,20 @@ def runOne(args, file, subcmd, cfgs):
     ci_lib_dir = os.path.join(cfgs.HOME_DIR, ci_lib_const)
     global TOTAL_CASES, COUNT_CURRENT_CASE
     if path.is_file():
+        case_config, case_config_dir = load_case_config(file, cfgs)
+        if case_config:
+            case_name = path.stem
+            if case_config.has_section("skip"):
+                skip_cases = case_config.get("skip", "cases", fallback="").strip()
+                if skip_cases:
+                    skip_list = [c.strip() for c in skip_cases.split(",") if c.strip()]
+                    if case_name in skip_list:
+                        cfgs.LOG.info(f"用例 {case_name} 已在 case_config.cfg 中屏蔽，跳过执行")
+                        COUNT_CURRENT_CASE += 1
+                        cfgs.LOG.info(" >>=============================================<<当前进度{:.2f}% ".format(
+                            float(COUNT_CURRENT_CASE) / float(TOTAL_CASES) * 100))
+                        cfgs.LOG.info("")
+                        return
         name = (path.name + "_").split(".")
         name = "_".join(name)
         runPath = os.path.join(cfgs.temp_dir, name)
@@ -2638,6 +2901,16 @@ def runOne(args, file, subcmd, cfgs):
                 except Exception as e:
                     cfgs.LOG.warn(f"无法复制文件： {copy_path}, 异常：{e}")
             else:
+                if case_config and case_config_dir:
+                    case_name = path.stem
+                    if case_config.has_section("pre_setup") and case_config.has_option("pre_setup", case_name):
+                        pre_script = case_config.get("pre_setup", case_name).strip()
+                        if pre_script:
+                            script_path = pre_script if os.path.isabs(pre_script) else os.path.join(case_config_dir, pre_script)
+                            cfgs.LOG.info(f"执行前置脚本: {script_path}")
+                            pre_result = subprocess.run(script_path, shell=True, cwd=case_config_dir)
+                            if pre_result.returncode != 0:
+                                cfgs.LOG.warn(f"前置脚本执行失败(返回码:{pre_result.returncode})")
                 case_one_return_code = 0
                 # 根据 import 语句过滤需要链接的库（合并源码和测试用例的 import）
                 import_pkgs = parse_imports_from_case(file)
@@ -2696,6 +2969,16 @@ def runOne(args, file, subcmd, cfgs):
                         if failed > 0 or error > 0:
                             case_one_return_code = 1
                 else:
+                    if case_config and case_config_dir:
+                        case_name = path.stem
+                        if case_config.has_section("post_teardown") and case_config.has_option("post_teardown", case_name):
+                            post_script = case_config.get("post_teardown", case_name).strip()
+                            if post_script:
+                                script_path = post_script if os.path.isabs(post_script) else os.path.join(case_config_dir, post_script)
+                                cfgs.LOG.info(f"执行后置脚本: {script_path}")
+                                post_result = subprocess.run(script_path, shell=True, cwd=case_config_dir)
+                                if post_result.returncode != 0:
+                                    cfgs.LOG.warn(f"后置脚本执行失败(返回码:{post_result.returncode})")
                     # remove runPath
                     if args.clean:
                         shutil.rmtree(runPath)
@@ -3436,6 +3719,20 @@ def get_transitive_dependencies(dep_cache, package_name, visited=None):
     return all_deps
 
 
+def is_package_in_dep_cache(dep_cache, pkg_name):
+    """检查包是否存在于 dep_cache 中"""
+    if not dep_cache:
+        return False
+    sections = ["bin", "pkg-build"]
+    for section in sections:
+        if section not in dep_cache:
+            continue
+        for cjo_path, cjo_info in dep_cache[section].items():
+            if cjo_info.get("package") == pkg_name:
+                return True
+    return False
+
+
 def filter_library_by_imports(library_str, import_pkgs, home_dir=None):
     """根据 import 语句过滤 -l 库列表，只保留匹配的 stdx 库和非 stdx 库
 
@@ -3525,11 +3822,16 @@ def filter_library_by_imports(library_str, import_pkgs, home_dir=None):
                 should_include = True
             elif dep_cache:
                 # 检查这个库是否是某个 import 包的依赖
+                found_in_deps = False
                 for pkg in import_pkgs:
                     trans_deps = get_transitive_dependencies(dep_cache, pkg)
                     if pkg_name in trans_deps:
                         should_include = True
+                        found_in_deps = True
                         break
+                # 如果 dep_cache 中没有这个包的任何信息，说明是外部 cjpm 库，保留
+                if not found_in_deps and not is_package_in_dep_cache(dep_cache, pkg_name):
+                    should_include = True
         else:
             # stdx 库：检查是否匹配任何 import 的前缀
             for pkg in import_pkgs:
@@ -3574,6 +3876,17 @@ def run_one_case(args, file_path, run_option, compile_option, target, cfgs):
     global error_list
     logger.setStream(f"{os.path.basename(file_path)}.log")
 
+    case_config, case_config_dir = load_case_config(file_path, cfgs)
+    if case_config:
+        case_name = Path(file_path).stem
+        if case_config.has_section("skip"):
+            skip_cases = case_config.get("skip", "cases", fallback="").strip()
+            if skip_cases:
+                skip_list = [c.strip() for c in skip_cases.split(",") if c.strip()]
+                if case_name in skip_list:
+                    logger.info(f"用例 {case_name} 已在 case_config.cfg 中屏蔽，跳过执行")
+                    return
+
     case_run_option, dependence, macro_cmd, is_valid_case = get_cmd_info(file_path, target, cfgs)
     if not is_valid_case:
         logger.warning(f"{file_path} is a invalid case, skip.")
@@ -3602,6 +3915,17 @@ def run_one_case(args, file_path, run_option, compile_option, target, cfgs):
     import_pkgs = parse_imports_from_case(file_path)
     import_pkgs |= parse_imports_from_source(cfgs.HOME_DIR)
     filtered_library = filter_library_by_imports(cfgs.LIBRARY, import_pkgs, cfgs.HOME_DIR)
+    # 执行前置脚本
+    if case_config and case_config_dir:
+        case_name = Path(file_path).stem
+        if case_config.has_section("pre_setup") and case_config.has_option("pre_setup", case_name):
+            pre_script = case_config.get("pre_setup", case_name).strip()
+            if pre_script:
+                script_path = pre_script if os.path.isabs(pre_script) else os.path.join(case_config_dir, pre_script)
+                logger.info(f"执行前置脚本: {script_path}")
+                pre_result = subprocess.run(script_path, shell=True, cwd=case_config_dir)
+                if pre_result.returncode != 0:
+                    logger.warning(f"前置脚本执行失败(返回码:{pre_result.returncode})")
     # case_import_cmd = '" --import-path="'
     # case_library_path_L_cmd = " -L "
     compile_cmd = f'cjc {cfgs.Woff} {args.optimize} {macro_cmd} ' \
@@ -3639,7 +3963,8 @@ def run_one_case(args, file_path, run_option, compile_option, target, cfgs):
         run_case_cmd = f"hdc shell cd {ohos_dir};chmod -R 777 *;export LD_LIBRARY_PATH={ohos_dir};./{out_file}"
     else:
         if platform_str == "linux":
-            run_case_cmd = f"cd {out_dir};./{out_file} {run_option} {fuzz_cmd} -timeout=10800"  # -rss_limit_mb=16384
+            ld_path = os.environ.get('LD_LIBRARY_PATH', '')
+            run_case_cmd = f"cd {out_dir};LD_LIBRARY_PATH=\"{ld_path}\" ./{out_file} {run_option} {fuzz_cmd} -timeout=10800"
         elif platform_str == "darwin":
             dyld_path = os.environ.get('DYLD_LIBRARY_PATH', '')
             run_case_cmd = f"cd {out_dir};DYLD_LIBRARY_PATH=\"{dyld_path}:$DYLD_LIBRARY_PATH\" ./{out_file} {run_option} {fuzz_cmd} -timeout=10800"
@@ -3677,6 +4002,18 @@ def run_one_case(args, file_path, run_option, compile_option, target, cfgs):
 
     # 收集测试结果
     collect_test_result(file_path, output, return_code, test_time)
+
+    # 执行后置脚本
+    if case_config and case_config_dir:
+        case_name = Path(file_path).stem
+        if case_config.has_section("post_teardown") and case_config.has_option("post_teardown", case_name):
+            post_script = case_config.get("post_teardown", case_name).strip()
+            if post_script:
+                script_path = post_script if os.path.isabs(post_script) else os.path.join(case_config_dir, post_script)
+                logger.info(f"执行后置脚本: {script_path}")
+                post_result = subprocess.run(script_path, shell=True, cwd=case_config_dir)
+                if post_result.returncode != 0:
+                    logger.warning(f"后置脚本执行失败(返回码:{post_result.returncode})")
 
     if args.clean:
         for root_p, _, out_dir_files in os.walk(out_dir):
@@ -4144,6 +4481,8 @@ def HLTtest(args, cfgs):
 
     signal.signal(signal.SIGINT, signal_handler)
 
+    setup_external_libs(cfgs, dirs, log=logger)
+    run_global_script(cfgs, dirs, "global_setup", log=logger)
     for root, _, files in os.walk(dirs):
         for f in files:
             if f.endswith(".cj"):
@@ -4156,6 +4495,7 @@ def HLTtest(args, cfgs):
                             run_one_case(args, os.path.join(root, f), run_options, compile_options, target, cfgs)
                 else:
                     run_one_case(args, os.path.join(root, f), run_options, compile_options, target, cfgs)
+    run_global_script(cfgs, dirs, "global_teardown", log=logger)
     try:
         if args.HLT:
             gen_report(args, cfgs)
