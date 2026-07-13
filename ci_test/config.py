@@ -10,9 +10,8 @@ import subprocess
 from tomlkit import parse
 
 str_head_1 = [233, 166, 131, 208, 152, 32, 116, 101, 115, 116, 32]
-str_head_2 = [27, 91, 52, 70, 27, 55, 27, 91, 57, 57, 57, 57, 69, 27, 91, 51, 70, 233, 166, 131, 230, 145, 157, 32, 103,
-              114, 111, 117, 112, 32, 100, 101, 102, 97, 117, 108, 116]
-str_tail_1 = [41, 32, 27, 56, 27, 91, 48, 74, 27, 55, 27, 91, 59, 114, 27, 56]  # 尾
+str_head_2 = [27, 91, 52, 70, 27, 55, 27, 91, 57, 57, 57, 57, 69, 27, 91, 51, 70, 233, 166, 131, 230, 145, 157, 32, 103, 114, 111, 117, 112, 32, 100, 101, 102, 97, 117, 108, 116]
+str_tail_1 = [41, 32, 27, 56, 27, 91, 48, 74, 27, 55, 27, 91, 59, 114, 27, 56] # 尾
 
 
 def find_readme_file(home_dir):
@@ -23,10 +22,10 @@ def find_readme_file(home_dir):
     - README
     - readme.md
     - 其他包含 "readme" 的文件（模糊匹配）
-
+    
     Args:
         home_dir: 项目根目录路径
-
+        
     Returns:
         str: README 文件的完整路径，如果未找到则返回 None
     """
@@ -37,13 +36,13 @@ def find_readme_file(home_dir):
         'readme.md',
         'README.MD'
     ]
-
+    
     # 首先检查最常见的文件名
     for readme_name in common_readme_names:
         readme_path = os.path.join(home_dir, readme_name)
         if os.path.exists(readme_path) and os.path.isfile(readme_path):
             return readme_path
-
+    
     # 如果常见名称都没找到，使用模糊匹配查找包含 "readme" 的文件
     try:
         for file_name in os.listdir(home_dir):
@@ -52,18 +51,18 @@ def find_readme_file(home_dir):
             if os.path.isfile(file_path) and 'readme' in file_name.lower():
                 # 排除一些特殊情况（通常是辅助文档而非主 README）
                 excluded_patterns = [
-                    'opensource',  # README.OpenSource
-                    '_cn', '_en',  # README_cn.md, README_en.md
-                    '.opensource',  # README.opensource
-                    'changelog',  # README_CHANGELOG
-                    'license',  # README_LICENSE
+                    'opensource',      # README.OpenSource
+                    '_cn', '_en',      # README_cn.md, README_en.md
+                    '.opensource',     # README.opensource
+                    'changelog',       # README_CHANGELOG
+                    'license',         # README_LICENSE
                 ]
                 # 如果文件名不包含排除模式，则认为是主 README
                 if not any(pattern in file_name.lower() for pattern in excluded_patterns):
                     return file_path
     except Exception as e:
         pass
-
+    
     return None
 
 
@@ -74,47 +73,45 @@ def get_cjc_version_from_readme(readme_path):
     1. badge 格式: badge/cjc-v<version>-... 或 badge/cjc-<version>-...
     2. 直接文本格式: cjc: <version>, 仓颉版本: <version>, Cangjie: <version>
     3. 其他格式
-
+    
     Args:
         readme_path: README.md 文件的路径
-
+        
     Returns:
         str: cjc 版本号，如果未找到则返回 None
     """
     if not os.path.exists(readme_path):
         return None
-
+    
     try:
         with open(readme_path, 'r', encoding='UTF-8') as f:
             content = f.read()
             lines = content.split('\n')
-
+            
             # 优先尝试从 badge 格式提取（通常在前几行）
             for line in lines[:20]:  # 只检查前20行，badge 通常在文件开头
                 # badge 格式: badge/cjc-v<version>-... 或 badge/cjc-<version>-...
                 badge_match = re.search(r'badge/cjc-(?:v)?([0-9]+\.[0-9]+\.[0-9]+(?:\.[0-9]+)?)-', line)
                 if badge_match:
                     return badge_match.group(1)
-
+                
                 # 其他 badge 格式变体
                 badge_match2 = re.search(r'cjc.*?(?:v)?([0-9]+\.[0-9]+\.[0-9]+(?:\.[0-9]+)?)', line, re.IGNORECASE)
                 if badge_match2:
                     return badge_match2.group(1)
-
+            
             # 尝试从文本格式提取
             for line in lines:
                 # 格式: cjc: <version>, 仓颉版本: <version>, Cangjie: <version>
-                text_match = re.search(r'(?:cjc|仓颉版本|Cangjie)[:\s]+(?:v)?([0-9]+\.[0-9]+\.[0-9]+(?:\.[0-9]+)?)',
-                                       line, re.IGNORECASE)
+                text_match = re.search(r'(?:cjc|仓颉版本|Cangjie)[:\s]+(?:v)?([0-9]+\.[0-9]+\.[0-9]+(?:\.[0-9]+)?)', line, re.IGNORECASE)
                 if text_match:
                     return text_match.group(1)
-
+                
                 # 格式: cjc version: <version>
-                text_match2 = re.search(r'cjc\s+version[:\s]+(?:v)?([0-9]+\.[0-9]+\.[0-9]+(?:\.[0-9]+)?)', line,
-                                        re.IGNORECASE)
+                text_match2 = re.search(r'cjc\s+version[:\s]+(?:v)?([0-9]+\.[0-9]+\.[0-9]+(?:\.[0-9]+)?)', line, re.IGNORECASE)
                 if text_match2:
                     return text_match2.group(1)
-
+            
             return None
     except Exception as e:
         if hasattr(get_cjc_version_from_readme, 'LOG'):
@@ -136,18 +133,16 @@ class ArgConfig:
             {
                 "aarch64-linux-ohos": "https://gitcode.com/Cangjie/cangjie-stdx-bin/releases/download/v1.0.1.1/cangjie-stdx-ohos-aarch64-1.0.1.1.zip",
                 "aarch64": "https://gitcode.com/Cangjie/cangjie-stdx-bin/releases/download/v1.0.1.1/cangjie-stdx-linux-aarch64-1.0.1.1.zip",
-                "x86_64-unknown-linux-gnu": "https://gitcode.com/Cangjie/cangjie-stdx-bin/releases/download/v1.0.1.1/cangjie-stdx-linux-x64-1.0.1.1.zip",
+                "x86_64-unknown-linux-gnu":"https://gitcode.com/Cangjie/cangjie-stdx-bin/releases/download/v1.0.1.1/cangjie-stdx-linux-x64-1.0.1.1.zip",
                 "x86_64-linux-ohos": "https://gitcode.com/Cangjie/cangjie-stdx-bin/releases/download/v1.0.1.1/cangjie-stdx-ohos-x64-1.0.1.1.zip",
                 "windows": "https://gitcode.com/Cangjie/cangjie-stdx-bin/releases/download/v1.0.1.1/cangjie-stdx-windows-x64-1.0.1.1.zip"
             },
         "1.0.3":
             {
-                "aarch64-linux-ohos": "https://gitcode.com/Cangjie/cangjie-stdx-bin/releases/download/v1.0.1.1/cangjie-stdx-ohos-aarch64-1.0.1.1.zip",
-                # TODO 未发现release版本
+                "aarch64-linux-ohos": "https://gitcode.com/Cangjie/cangjie-stdx-bin/releases/download/v1.0.1.1/cangjie-stdx-ohos-aarch64-1.0.1.1.zip",  # TODO 未发现release版本
                 "aarch64": "https://gitcode.com/Cangjie/cangjie_stdx/releases/download/v1.0.3.1/cangjie-stdx-linux-aarch64-1.0.3.1.zip",
-                "x86_64-unknown-linux-gnu": "https://gitcode.com/Cangjie/cangjie_stdx/releases/download/v1.0.3.1/cangjie-stdx-linux-x64-1.0.3.1.zip",
-                "x86_64-linux-ohos": "https://gitcode.com/Cangjie/cangjie-stdx-bin/releases/download/v1.0.1.1/cangjie-stdx-ohos-x64-1.0.1.1.zip",
-                # TODO 未发现release版本
+                "x86_64-unknown-linux-gnu":"https://gitcode.com/Cangjie/cangjie_stdx/releases/download/v1.0.3.1/cangjie-stdx-linux-x64-1.0.3.1.zip",
+                "x86_64-linux-ohos": "https://gitcode.com/Cangjie/cangjie-stdx-bin/releases/download/v1.0.1.1/cangjie-stdx-ohos-x64-1.0.1.1.zip",  # TODO 未发现release版本
                 "windows": "https://gitcode.com/Cangjie/cangjie_stdx/releases/download/v1.0.3.1/cangjie-stdx-windows-x64-1.0.3.1.zip"
             },
         "1.0.4":
@@ -224,7 +219,7 @@ class ArgConfig:
     WHICH_CJC_OUT_STR = None
     IS_SELF_CONFIGURATION = False
     LOG_CMD = "simple"  # simple: 简化命令输出, full: 全量打印
-    SHOW_WARN = False  # 是否显示编译告警日志
+    SHOW_WARN = False   # 是否显示编译告警日志
 
     def __init__(self):
         master_cjc = shutil.which("cjc")
@@ -294,7 +289,7 @@ class ArgConfig:
             self.MODULE_NAME = self.BUILD_PARMS['package']['name']
         except:
             self.MODULE_NAME = os.path.basename(self.HOME_DIR)
-
+        
         # 优先从 README 文件获取 cjc 版本
         readme_path = find_readme_file(self.HOME_DIR)
         if readme_path:
@@ -316,7 +311,7 @@ class ArgConfig:
                 self.LOG.info(f"从 cjpm.toml 获取到 cjc 版本（最低兼容版本）: {self.EXPECT_CJC_VERSION}")
             except:
                 pass
-
+        
         try:
             for key, value in self.BUILD_PARMS['ffi'].items():
                 if key == "c":
@@ -328,7 +323,7 @@ class ArgConfig:
             for line in file.readlines():
                 if line.startswith("#"):
                     self.CUSTOM_MAP[re.search(r"\[.*?\]", line).group()[1:-1]] = re.search(r"\{.*?\}", line).group()[
-                        1:-1]
+                                                                                 1:-1]
             file.close()
         except:
             self.LOG.warn("toml 配置文件定义出错, 格式 # [key]={value}, 请检查")
@@ -339,7 +334,7 @@ class ArgConfig:
             self.BUILD_PARMS = json.load(file)
             try:
                 self.MODULE_NAME = self.BUILD_PARMS['name']
-
+                
                 # 优先从 README 文件获取 cjc 版本
                 readme_path = find_readme_file(self.HOME_DIR)
                 if readme_path:
@@ -355,7 +350,7 @@ class ArgConfig:
                     # 如果没有 README 文件，则从 module.json 获取
                     self.EXPECT_CJC_VERSION = self.BUILD_PARMS['cjc-version']
                     self.LOG.info(f"从 module.json 获取到 cjc 版本: {self.EXPECT_CJC_VERSION}")
-
+                
                 self.MODULE_FOREIGN_REQUIRES = self.BUILD_PARMS['foreign_requires']
             except:
                 self.MODULE_NAME = os.path.basename(self.HOME_DIR)
@@ -402,8 +397,8 @@ class ArgConfig:
 
 def llt_check_not_start_or_end_with_target(msg) -> bool:
     return check_not_start_or_end_with_target(msg, str_head_1, True) and \
-        check_not_start_or_end_with_target(msg, str_head_2, True) and \
-        check_not_start_or_end_with_target(msg, str_tail_1, False)
+            check_not_start_or_end_with_target(msg, str_head_2, True) and \
+            check_not_start_or_end_with_target(msg, str_tail_1, False)
 
 
 def check_not_start_or_end_with_target(input_data, target_byte_arr, flag, encoding='utf-8'):

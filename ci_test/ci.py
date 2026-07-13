@@ -41,7 +41,8 @@ test_report = {
     "error_cases": 0,
     "skipped_cases": 0,
     "cases": {},  # {test_class: [[case_name, status, time_elapsed, error_trace]]}
-    "class_times": {}  # {test_class: total_time}
+    "class_times": {},  # {test_class: total_time}
+    "raw_outputs": {}  # {test_class: raw_output} 用于补充解析失败/错误用例
 }
 
 if platform.system() == "Windows":
@@ -2585,13 +2586,13 @@ def setup_external_libs(cfgs, test_dir, log=None):
                 if f"-l {base} " not in cfgs.LIBRARY + " ":
                     cfgs.LIBRARY += f"-l {base} "
                     logger.info(f"添加第三方库: -L {dir_abs} -l {base}")
-        # 设置运行时库搜索路径：cjpm 构建传 .so 所在目录，其他类型传 lib_dest
+        # 设置运行时库搜索路径：cjpm 构建传 .so/.dll 所在目录，其他类型传 lib_dest
         if cjpm_build_success and cjpm_target_dir:
-            # 收集 target/ 下所有包含 .so 文件的目录，加入 LD_LIBRARY_PATH
+            # 收集 target/ 下所有包含 .so 或 .dll 文件的目录，加入运行时库搜索路径
             so_dirs = []
             for so_dirpath, _, so_filenames in os.walk(cjpm_target_dir):
                 for so_f in so_filenames:
-                    if pathlib.Path(so_f).suffix.lower() == ".so":
+                    if pathlib.Path(so_f).suffix.lower() in (".so", ".dll"):
                         so_dirs.append(so_dirpath)
                         break
             cangjie_env_setup(so_dirs)
@@ -2874,14 +2875,17 @@ def runOne(args, file, subcmd, cfgs):
                     items = item.split('/')
                     for sps in items:
                         copy_path = os.path.join(copy_path, sps)
+                    if not os.path.exists(copy_path):
+                        cfgs.LOG.warn(f"依赖文件/目录不存在，跳过复制: {copy_path}")
+                        continue
                     if os.path.isdir(copy_path):
                         shutil.copytree(copy_path, os.path.join(runPath, items[-1]))
                         shutil.copymode(copy_path, os.path.join(runPath, items[-1]))
                     else:
                         shutil.copyfile(copy_path, os.path.join(runPath, items[-1]))
                         shutil.copymode(copy_path, os.path.join(runPath, items[-1]))
-                finally:
-                    pass
+                except Exception as e:
+                    cfgs.LOG.warn(f"复制依赖文件失败: {copy_path}, 异常: {e}")
             if cfgs.OS_PLATFORM and cfgs.OS_PLATFORM == "windows":
                 if cfgs.WINDOWS_DLLS:
                     for dll in cfgs.WINDOWS_DLLS:
@@ -3555,6 +3559,9 @@ def collect_test_result(file_path, output, return_code, run_time):
             test_report["cases"][class_name] = []
             test_report["class_times"][class_name] = 0.0
 
+        # 保存原始输出，用于后续补充解析失败/错误用例
+        test_report["raw_outputs"][class_name] = clean_output
+
         # 解析具体的用例结果
         for line in output.split('\n'):
             if "[ PASSED ] CASE:" in line:
@@ -4224,6 +4231,47 @@ def gen_junit_report(cfgs, cases, tcs_time):
     logger.info(f"Skipped: {skip_count}")
     logger.info(f"Ratio  : {round((pass_count + skip_count) / total_count * 100, 2) if total_count > 0 else 0}%")
 
+    # 补充解析：如果 fail_list/error_list/skip_list 为空但计数大于0，从原始输出中提取
+    if len(fail_list) < fail_count or len(error_list) < error_count or len(skip_list) < skip_count:
+        for class_name, raw_output in test_report.get("raw_outputs", {}).items():
+            for line in raw_output.split('\n'):
+                # 匹配多种失败/错误输出格式
+                if len(fail_list) < fail_count:
+                    # [ FAILED ] CASE: xxx
+                    m = re.search(r"\[ FAILED \] CASE:\s*(\S+)", line)
+                    if m and m.group(1) not in fail_list:
+                        fail_list.append(f"{class_name}.{m.group(1)}")
+                        continue
+                    # CASE xxx ... FAILED / xxx ... FAILED
+                    m = re.search(r"CASE:\s*(\S+).*FAILED", line) or re.search(r"(\S+).*\bFAILED\b", line)
+                    if m and f"{class_name}.{m.group(1)}" not in fail_list and "TOTAL" not in line and "PASSED" not in line:
+                        fail_list.append(f"{class_name}.{m.group(1)}")
+                        continue
+
+                if len(error_list) < error_count:
+                    m = re.search(r"\[ ERROR \] CASE:\s*(\S+)", line)
+                    if m and f"{class_name}.{m.group(1)}" not in error_list:
+                        error_list.append(f"{class_name}.{m.group(1)}")
+                        continue
+                    m = re.search(r"CASE:\s*(\S+).*ERROR", line) or re.search(r"(\S+).*\bERROR\b", line)
+                    if m and f"{class_name}.{m.group(1)}" not in error_list and "TOTAL" not in line and "PASSED" not in line:
+                        error_list.append(f"{class_name}.{m.group(1)}")
+                        continue
+
+                if len(skip_list) < skip_count:
+                    m = re.search(r"\[ SKIPPED \] CASE:\s*(\S+)", line)
+                    if m and f"{class_name}.{m.group(1)}" not in skip_list:
+                        skip_list.append(f"{class_name}.{m.group(1)}")
+                        continue
+
+    # 如果仍然无法提取到具体的用例名，添加提示信息
+    if fail_count > 0 and len(fail_list) == 0:
+        fail_list.append(f"(Failed case details not captured from output. {fail_count} case(s) failed. Check log/all.log for details.)")
+    if error_count > 0 and len(error_list) == 0:
+        error_list.append(f"(Error case details not captured from output. {error_count} case(s) errored. Check log/all.log for details.)")
+    if skip_count > 0 and len(skip_list) == 0:
+        skip_list.append(f"(Skipped case details not captured from output. {skip_count} case(s) skipped. Check log/all.log for details.)")
+
     show_case_list(fail_list, "Failed")
     show_case_list(error_list, "Error")
     show_case_list(skip_list, "Skipped")
@@ -4353,6 +4401,44 @@ def gen_report_from_dict(cfgs):
     logger.info(
         f"Ratio  : {round((test_report['passed_cases'] + test_report['skipped_cases']) / test_report['total_cases'] * 100, 2) if test_report['total_cases'] > 0 else 0}%")
 
+    # 补充解析：如果 fail_list/error_list/skip_list 为空但计数大于0，从原始输出中提取
+    if len(fail_list) < fail_count or len(error_list) < error_count or len(skip_list) < skip_count:
+        for class_name, raw_output in test_report.get("raw_outputs", {}).items():
+            for line in raw_output.split('\n'):
+                if len(fail_list) < fail_count:
+                    m = re.search(r"\[ FAILED \] CASE:\s*(\S+)", line)
+                    if m and f"{class_name}.{m.group(1)}" not in fail_list:
+                        fail_list.append(f"{class_name}.{m.group(1)}")
+                        continue
+                    m = re.search(r"CASE:\s*(\S+).*FAILED", line) or re.search(r"(\S+).*\bFAILED\b", line)
+                    if m and f"{class_name}.{m.group(1)}" not in fail_list and "TOTAL" not in line and "PASSED" not in line:
+                        fail_list.append(f"{class_name}.{m.group(1)}")
+                        continue
+
+                if len(error_list) < error_count:
+                    m = re.search(r"\[ ERROR \] CASE:\s*(\S+)", line)
+                    if m and f"{class_name}.{m.group(1)}" not in error_list:
+                        error_list.append(f"{class_name}.{m.group(1)}")
+                        continue
+                    m = re.search(r"CASE:\s*(\S+).*ERROR", line) or re.search(r"(\S+).*\bERROR\b", line)
+                    if m and f"{class_name}.{m.group(1)}" not in error_list and "TOTAL" not in line and "PASSED" not in line:
+                        error_list.append(f"{class_name}.{m.group(1)}")
+                        continue
+
+                if len(skip_list) < skip_count:
+                    m = re.search(r"\[ SKIPPED \] CASE:\s*(\S+)", line)
+                    if m and f"{class_name}.{m.group(1)}" not in skip_list:
+                        skip_list.append(f"{class_name}.{m.group(1)}")
+                        continue
+
+    # 如果仍然无法提取到具体的用例名，添加提示信息
+    if fail_count > 0 and len(fail_list) == 0:
+        fail_list.append(f"(Failed case details not captured from output. {fail_count} case(s) failed. Check log/all.log for details.)")
+    if error_count > 0 and len(error_list) == 0:
+        error_list.append(f"(Error case details not captured from output. {error_count} case(s) errored. Check log/all.log for details.)")
+    if skip_count > 0 and len(skip_list) == 0:
+        skip_list.append(f"(Skipped case details not captured from output. {skip_count} case(s) skipped. Check log/all.log for details.)")
+
     show_case_list(fail_list, "Failed")
     show_case_list(error_list, "Error")
     show_case_list(skip_list, "Skipped")
@@ -4471,9 +4557,40 @@ def HLTtest(args, cfgs):
     # 设置用例运行环境变量
     os.environ["ci_project_home"] = cfgs.HOME_DIR
 
+    # 预收集所有待运行的测试用例文件
+    all_case_files = []
+    for root, _, files in os.walk(dirs):
+        for f in files:
+            if f.endswith(".cj"):
+                if args.case:
+                    if args.case.endswith(".cj"):
+                        if args.case == str(f):
+                            all_case_files.append(os.path.join(root, f))
+                    else:
+                        if "{}.cj".format(args.case) == str(f):
+                            all_case_files.append(os.path.join(root, f))
+                else:
+                    all_case_files.append(os.path.join(root, f))
+
+    # 跟踪已运行的用例文件
+    completed_case_files = set()
+
     def signal_handler(sig, frame):
+        global test_report
         logger.info("\n收到中断信号，正在生成测试报告...")
         try:
+            # 将未运行的用例计为跳过
+            for case_file in all_case_files:
+                if case_file not in completed_case_files:
+                    file_name = os.path.basename(case_file)
+                    class_name = os.path.splitext(file_name)[0]
+                    if class_name not in test_report["cases"]:
+                        test_report["cases"][class_name] = []
+                        test_report["class_times"][class_name] = 0.0
+                    test_report["cases"][class_name].append(
+                        [file_name, "SKIPPED", 0.0, "Interrupted", 0.0, case_file])
+                    test_report["total_cases"] += 1
+                    test_report["skipped_cases"] += 1
             gen_report(args, cfgs)
         except Exception as e:
             logger.error(f"生成报告时出错: {e}")
@@ -4483,18 +4600,9 @@ def HLTtest(args, cfgs):
 
     setup_external_libs(cfgs, dirs, log=logger)
     run_global_script(cfgs, dirs, "global_setup", log=logger)
-    for root, _, files in os.walk(dirs):
-        for f in files:
-            if f.endswith(".cj"):
-                if args.case:
-                    if args.case.endswith(".cj"):
-                        if args.case == str(f):
-                            run_one_case(args, os.path.join(root, f), run_options, compile_options, target, cfgs)
-                    else:
-                        if "{}.cj".format(args.case) == str(f):
-                            run_one_case(args, os.path.join(root, f), run_options, compile_options, target, cfgs)
-                else:
-                    run_one_case(args, os.path.join(root, f), run_options, compile_options, target, cfgs)
+    for case_file in all_case_files:
+        completed_case_files.add(case_file)
+        run_one_case(args, case_file, run_options, compile_options, target, cfgs)
     run_global_script(cfgs, dirs, "global_teardown", log=logger)
     try:
         if args.HLT:
