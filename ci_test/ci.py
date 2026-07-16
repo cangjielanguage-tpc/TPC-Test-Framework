@@ -3921,6 +3921,12 @@ def run_one_case(args, file_path, run_option, compile_option, target, cfgs):
     # 根据 import 语句过滤需要链接的库（合并源码和测试用例的 import）
     import_pkgs = parse_imports_from_case(file_path)
     import_pkgs |= parse_imports_from_source(cfgs.HOME_DIR)
+    # 解析依赖文件中的 import 语句，确保依赖文件的导包也被包含在编译指令中
+    if dependence:
+        for dep_file in dependence.split(" "):
+            dep_file = dep_file.strip()
+            if dep_file and dep_file != file_path and os.path.isfile(dep_file):
+                import_pkgs |= parse_imports_from_case(dep_file)
     filtered_library = filter_library_by_imports(cfgs.LIBRARY, import_pkgs, cfgs.HOME_DIR)
     # 执行前置脚本
     if case_config and case_config_dir:
