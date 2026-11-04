@@ -2,7 +2,6 @@
 # encoding= utf-8
 # @Copyright (c) Huawei Technologies Co., Ltd. 2024-2025. All rights reserved.
 # Licensed under the Apache-2.0 License. See LICENSE file for details.
-import locale
 import os
 from pathlib import Path
 from ci import main
@@ -16,7 +15,6 @@ if __name__ == '__main__':
     cof.HOME_DIR = os.getcwd()
     cof.LIB_DIR = None
     cof.TEST_DIR = os.path.join(os.getcwd(), 'test')
-    cof.ENCODING = locale.getpreferredencoding(False) # ('en_US', 'UTF-8')
     cof.FILE_ROOT = os.path.join(Path(__file__).parent.absolute())
     cof.HOME = Path(__file__).parent.absolute()
     cof.CANGJIE_SOURCE_DIR = os.path.join(cof.HOME_DIR, 'src')

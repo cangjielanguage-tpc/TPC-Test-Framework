@@ -26,6 +26,7 @@ from subprocess import PIPE
 from pathlib import Path
 from xml.dom import minidom
 from config import ArgConfig, llt_check_not_start_or_end_with_target
+from textio import decode_text, setup_stdio
 from tomlkit import parse, dump as dump_c
 from logging import handlers
 from logging.handlers import TimedRotatingFileHandler
@@ -42,6 +43,8 @@ test_report = {
     "skipped_cases": 0,
     "cases": {},  # {test_class: [[case_name, status, time_elapsed, error_trace]]}
     "class_times": {},  # {test_class: total_time}
+    "class_files": {},  # {test_class: 用例文件路径}
+    "class_stats": {},  # {test_class: {"failed": n, "error": n, "skipped": n}} 按文件的失败/错误/跳过统计
     "raw_outputs": {}  # {test_class: raw_output} 用于补充解析失败/错误用例
 }
 
@@ -64,13 +67,14 @@ def add_llt_common_arguments(parser):
     test_parser_optimize.add_argument("-O", help="编译构建优化选项")
     test_parser_optimize.add_argument("--coverage", action='store_true', help="跑测试用例是否用覆盖率方式测试")
     test_parser_path = parser.add_mutually_exclusive_group()
-    test_parser_path.add_argument("--case", help="指定单跑一个用例")
     test_parser_path.add_argument("--target", help="适用于ohos")
     test_parser_path.add_argument("--clean", action='store_true', help="是否清空测试临时目录")
-    test_parser_path.add_argument("-p", "--path", help="指定跑一个文件夹, 适用于在test/LLT文件夹多个文件夹方式")
+    test_parser_path.add_argument("-p", "--path",
+                                  help="指定跑一个文件夹（绝对/相对路径均可）；不存在时回退到默认测试目录")
+    parser.add_argument("--case", help="指定单跑一个用例，可与 --path 组合限定目录树")
     parser.add_argument("--log", help="指定日志输出文件路径，以追加形式写入")
-    parser.add_argument("--log-cmd", choices=["simple", "full"], default="simple",
-                        help="命令日志输出方式: simple=简化, full=全量")
+    parser.add_argument("--log-cmd", choices=["simple", "full"], default=None,
+                        help="命令日志输出方式: simple=简化, full=全量; 不传时读 ci_test.cfg [logging] log_cmd, 未配置则为 simple")
     parser.set_defaults(func=test)
 
 
@@ -83,17 +87,17 @@ def add_hlt_common_arguments(cjtest_parser):
     cjtest_parser_optimize = cjtest_parser.add_mutually_exclusive_group()
     cjtest_parser_optimize.add_argument("-O", help="HLT用例测试方式")
     cjtest_parser_optimize.add_argument("--coverage", action='store_true', help="HLT用例测试方式")
-    cjtest_parser_path = cjtest_parser.add_mutually_exclusive_group()
-    cjtest_parser_path.add_argument("--case", help="HLT用例测试方式")
-    cjtest_parser_path.add_argument("-p", "--path", help="HLT用例测试方式")
+    cjtest_parser.add_argument("--case", help="HLT用例文件名，可与 --path 组合限定目录树")
+    cjtest_parser.add_argument("-p", "--path",
+                               help="指定 HLT 用例目录（绝对/相对路径均可）；不存在时回退到 test/HLT")
     cjtest_parser.add_argument("--root", help="HLT用例测试方式")
     cjtest_parser_branch = cjtest_parser.add_mutually_exclusive_group()
     cjtest_parser_branch.add_argument("--clean", action='store_true', help="是否清空测试临时目录")
     cjtest_parser_branch.add_argument("--main", action='store_true', help="HLT用例测试方式")
     cjtest_parser_branch.add_argument("--fuzz", action='store_true', help="HLT用例测试方式")
     cjtest_parser.add_argument("--log", help="指定日志输出文件路径，以追加形式写入")
-    cjtest_parser.add_argument("--log-cmd", choices=["simple", "full"], default="simple",
-                               help="命令日志输出方式, simple: 简化输出, full: 全量打印")
+    cjtest_parser.add_argument("--log-cmd", choices=["simple", "full"], default=None,
+                               help="命令日志输出方式, simple: 简化输出, full: 全量打印; 不传时读 ci_test.cfg [logging] log_cmd, 未配置则为 simple")
 
 
 def __set_args_default_attribute(args, attr: str):
@@ -141,8 +145,8 @@ def parse_args(cfgs):
     coverage_parser_optimize = coverage_parser.add_mutually_exclusive_group()
     coverage_parser_optimize.add_argument('--LLT', action='store_true', help="指定跑LLT用例覆盖率")
     coverage_parser_optimize.add_argument('--HLT', action='store_true', help="指定跑HLT用例覆盖率")
-    # clean_parser = sub_parser.add_parser("clean", help="清空缓存文件")
-    # clean_parser.set_defaults(func=clean)
+    clean_parser = sub_parser.add_parser("clean", help="清空编译产物和覆盖率缓存文件")
+    clean_parser.set_defaults(func=clean)
     version_parser = sub_parser.add_parser("version", help="打印脚本版本信息")
     version_parser.set_defaults(func=print_version)
     version_parser.add_argument("--cangjie", action='store_true', help="打印仓颉项目版本")
@@ -150,7 +154,11 @@ def parse_args(cfgs):
 
     build_parser = sub_parser.add_parser("build", help="用于构建整个项目的命令")
     build_parser.add_argument("--target", help="适用于ohos的命令")
-    build_parser.add_argument("-f", "--full", action='store_true', help="是否是全量进行构建, 默认cjpm build -i")
+    build_build_mode = build_parser.add_mutually_exclusive_group()
+    build_build_mode.add_argument("-f", "--full", action='store_true',
+                                  help="全量构建（cjpm build），默认即全量构建，可不传")
+    build_build_mode.add_argument("-i", "--incremental", action='store_true',
+                                  help="增量构建（cjpm build -i），不传时默认全量构建")
     build_parser.add_argument("--coverage", action='store_true', help="是否使用覆盖率方式构建")
     build_parser.add_argument("--cj-home", help="设置仓颉环境路径")
     build_parser.add_argument("--stdx-home", help="设置仓颉环境路径")
@@ -160,8 +168,8 @@ def parse_args(cfgs):
     build_parser.add_argument("--debug", action='store_true', help="debug模式编译")
     build_parser.add_argument('--verbose', action='store_true', help="--verbose")
     build_parser.add_argument("--log", help="指定日志输出文件路径，以追加形式写入")
-    build_parser.add_argument("--log-cmd", choices=["simple", "full"], default="simple",
-                              help="命令日志输出方式, simple: 简化输出, full: 全量打印")
+    build_parser.add_argument("--log-cmd", choices=["simple", "full"], default=None,
+                              help="命令日志输出方式, simple: 简化输出, full: 全量打印; 不传时读 ci_test.cfg [logging] log_cmd, 未配置则为 simple")
     build_parser.add_argument("--show-warn", action='store_true', help="显示编译告警日志, 默认不显示")
     build_parser.set_defaults(func=build)
 
@@ -174,6 +182,7 @@ def parse_args(cfgs):
     build_parser.add_argument("--username", type=str, help="git用户")
     build_parser.add_argument("--password", type=str, help="git密码")
     build_parser.add_argument("-f", "--force", action='store_true', help="是否强制覆盖原来文件夹")
+    build_parser.add_argument("--log", help="指定日志输出文件路径，以追加形式写入")
     build_parser.set_defaults(func=download)
 
     add_llt_common_arguments(sub_parser.add_parser("test", help="用于LLT测试命令"))
@@ -230,14 +239,14 @@ def parse_args(cfgs):
     fuzz_parser.add_argument("--root")
     fuzz_parser.add_argument("--case")
     fuzz_parser.add_argument("--clean", action='store_true', help="是否清空测试临时目录")
-    fuzz_parser.add_argument("-p", "--path")
+    fuzz_parser.add_argument("-p", "--path", help="指定 fuzz 用例目录（绝对/相对路径均可）；不存在时回退到 test/fuzz")
 
     bench_parser = sub_parser.add_parser("bench", help="性能用例测试方式, 会寻找test/bench文件夹是否存在性能用例")
     bench_parser.set_defaults(func=bench_mark)
     bench_parser.add_argument("--root", help="")
     bench_parser.add_argument("--case", help="")
     bench_parser.add_argument("--clean", action='store_true', help="是否清空测试临时目录")
-    bench_parser.add_argument("-p", "--path", help="")
+    bench_parser.add_argument("-p", "--path", help="指定性能用例目录（绝对/相对路径均可）；不存在时回退到 test/benchmark")
 
     ## 计算 DT个数方法
     count_parser = sub_parser.add_parser("count", help="默认会统计LLT和HLT总计的用例数")
@@ -256,14 +265,20 @@ def parse_args(cfgs):
     if len(sys.argv) == 1:
         parser.print_help()
         sys.exit(1)
-    # download 命令不需要 cjc 环境，跳过检查
-    if not (hasattr(par, 'func') and par.func.__name__ == 'download'):
+    # download/clean 命令不需要 cjc 环境，跳过检查
+    if not (hasattr(par, 'func') and par.func.__name__ in ('download', 'clean')):
         config_cjc(par)
     try:
         par.func(par)
     except KeyboardInterrupt:
         cfgs.LOG.info("用户中断程序异常退出.")
         exit(1)
+    except Exception as e:
+        # download 失败不抛出异常退出(退出码1), 保证CI后续动作继续执行
+        if hasattr(par, 'func') and par.func.__name__ == 'download':
+            cfgs.LOG.error(f"download 执行异常: {e}，不影响后续流程.")
+        else:
+            raise
 
 
 def perf_test(args):
@@ -382,8 +397,21 @@ def cangjie_ut(args):
 
 
 def main(cfgs):
+    setup_stdio()
     cfgs.LOG = init_log(cfgs, "ci_test")
     parse_args(cfgs)
+
+
+def clean(args):
+    cfgs = args.CANGJIE_CI_TEST_CFGS
+    dirs_to_clean = ["target", "test_temp"]
+    for d in dirs_to_clean:
+        clean_dir = os.path.join(cfgs.HOME_DIR, d)
+        if os.path.exists(clean_dir):
+            shutil.rmtree(clean_dir, ignore_errors=True)
+            cfgs.LOG.info(f"已清理目录: {clean_dir}")
+        else:
+            cfgs.LOG.info(f"目录不存在, 跳过: {clean_dir}")
 
 
 def coverage(args):
@@ -429,6 +457,10 @@ def build(args):
     cfgs = args.CANGJIE_CI_TEST_CFGS
     if args.log:
         cfgs.LOG = init_log(cfgs, "ci_test", log_file_path=args.log)
+    # ciTest build 默认全量构建（cjpm build）；显式传 -i/--incremental 时增量构建（cjpm build -i）。
+    # 其他子命令（如 coverage）内部调用 build 时无 incremental 属性，args.full 已按需指定，不在此翻转。
+    if hasattr(args, 'incremental'):
+        args.full = args.full or not args.incremental
     if args.full:
         cfgs.LOG.info(f"清理build构建目录: {os.path.join(cfgs.HOME_DIR, cfgs.BUILD_BIN)}")
         shutil.rmtree(os.path.join(cfgs.HOME_DIR, cfgs.BUILD_BIN), ignore_errors=True)
@@ -437,6 +469,8 @@ def build(args):
 
 def download(args):
     cfgs = args.CANGJIE_CI_TEST_CFGS
+    if args.log:
+        cfgs.LOG = init_log(cfgs, "ci_test", log_file_path=args.log)
     if args.owner is None:
         args.owner = 'Cangjie-TPC'
     if args.repo is None:
@@ -496,7 +530,10 @@ def download(args):
     clone_cmd = [
         "git", "clone", "--depth", str(args.depth), repo_url, '-b', args.bench, clone_target_dir  # 克隆到指定目录
     ]
-    cfgs.LOG.info(f"执行Git命令：{' '.join(clone_cmd).replace(args.password, '****')}")
+    clone_cmd_log = ' '.join(clone_cmd)
+    if args.password:
+        clone_cmd_log = clone_cmd_log.replace(args.password, '****')
+    cfgs.LOG.info(f"执行Git命令：{clone_cmd_log}")
 
     # 5. 执行克隆命令（捕获异常并记录日志）
     clone_success = False
@@ -512,6 +549,7 @@ def download(args):
             stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
+            errors="replace",
             check=True
         )
         clone_success = True
@@ -542,7 +580,10 @@ def download(args):
             retry_clone_cmd = [
                 "git", "clone", "--depth", str(args.depth), repo_url, '-b', source_repo, clone_target_dir
             ]
-            cfgs.LOG.info(f"重试Git命令：{' '.join(retry_clone_cmd).replace(args.password, '****')}")
+            retry_cmd_log = ' '.join(retry_clone_cmd)
+            if args.password:
+                retry_cmd_log = retry_cmd_log.replace(args.password, '****')
+            cfgs.LOG.info(f"重试Git命令：{retry_cmd_log}")
 
             try:
                 result = subprocess.run(
@@ -551,6 +592,7 @@ def download(args):
                     stderr=subprocess.PIPE,
                     text=True,
                     encoding="utf-8",
+                    errors="replace",
                     check=True
                 )
                 clone_success = True
@@ -602,7 +644,8 @@ def download(args):
             cfgs.LOG.info(f"LLT 目录: {llt_dir} (存在: {os.path.exists(llt_dir)})")
             return 0
         else:
-            raise Exception(error_msg)
+            cfgs.LOG.error("仓库克隆失败且本地无测试文件，download 失败退出，不影响后续流程.")
+            return
 
     # 打印克隆后的目录列表
     try:
@@ -621,8 +664,8 @@ def download(args):
             cfgs.LOG.info('正在删除test文件夹')
             # shutil.rmtree(os.path.join(cfgs.HOME_DIR, target_dir), ignore_errors=True)
         else:
-            cfgs.LOG.error(f'{target_dir}文件夹已经存在.')
-            raise Exception(f'{target_dir}文件夹已经存在.')
+            cfgs.LOG.error(f'{target_dir}文件夹已经存在，download 失败退出，不影响后续流程.')
+            return
     possible_dirs = ['test', 'LLT', 'HLT']
     existing_dirs = []
     clone_base_dir = os.path.join(cfgs.HOME_DIR, clone_target_dir)
@@ -651,7 +694,8 @@ def download(args):
     existing_dirs = find_test_dirs(clone_base_dir, possible_dirs, max_depth=2)
 
     if not existing_dirs:
-        raise FileNotFoundError(f"源文件夹不存在：{clone_target_dir} 下未找到 test/LLT/HLT 目录（递归深度2）")
+        cfgs.LOG.error(f"源文件夹不存在：{clone_target_dir} 下未找到 test/LLT/HLT 目录（递归深度2），download 失败退出，不影响后续流程.")
+        return
 
     # 过滤结果：优先保留更深层次的匹配目录
     # 如果某个目录的子目录也在匹配列表中，则跳过该目录（避免重复路径）
@@ -748,13 +792,13 @@ def download(args):
     elif cfgs.OS_PLATFORM == 'windows':
         cmd = f'rmdir /s /q "{delete_path}"'  # 去掉长路径前缀
         cfgs.LOG.warning(f"Python内置删除失败，尝试系统命令{cmd}删除...")
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        result = subprocess.run(cmd, shell=True, capture_output=True)
         if result.returncode == 0:
             cfgs.LOG.info(f"系统命令删除成功：{delete_path}")
         else:
-            cfgs.LOG.error(f"系统命令删除失败：{result.stderr}")
+            cfgs.LOG.error(f"系统命令删除失败：{decode_text(result.stderr).strip()}")
     else:
-        cfgs.LOG.warn(f"系统命令删除失败：{result.stderr}, 请手动删除临时目录")
+        cfgs.LOG.warn(f"临时目录删除失败：{delete_path}，请手动删除")
     cfgs.LOG.info(f"文件夹已移动到：{target_dir}")
 
 
@@ -763,16 +807,9 @@ def test(args):
     cfgs = args.CANGJIE_CI_TEST_CFGS
     if args.log:
         cfgs.LOG = init_log(cfgs, "ci_test", log_file_path=args.log)
-    if args.path and args.case:
-        cfgs.LOG.error("单跑用例和单跑指定文件夹, 不能同时设置. ")
-        exit(1)
-    elif args.path:
-        if os.path.exists(args.path):
-            if not os.path.isabs(args.path):
-                args.path = os.path.join(cfgs.HOME_DIR, args.path)
-        else:
-            cfgs.LOG.error("指定文件夹不存在. 请重试")
-            exit(1)
+    if args.path and not os.path.isabs(args.path):
+        # 允许指定任意目录；相对路径基于工程根目录解析
+        args.path = os.path.join(cfgs.HOME_DIR, args.path)
     # clean(cfgs)
     if args.coverage:
         args.optimize = ' -O0 --coverage'
@@ -793,13 +830,19 @@ def test(args):
         pass
     __find_cjpm_home_librarys(args, cfgs)
 
+    _signal_handler_entered = False
+
     def signal_handler(sig, frame):
+        if _signal_handler_entered:
+            cfgs.LOG.info("\n再次收到中断信号，强制退出...")
+            os._exit(1)
+        _signal_handler_entered = True
         cfgs.LOG.info("\n收到中断信号，正在生成测试报告...")
         try:
             end_build(cfgs)
         except Exception as e:
             cfgs.LOG.error(f"生成报告时出错: {e}")
-        exit(1)
+        os._exit(1)
 
     signal.signal(signal.SIGINT, signal_handler)
 
@@ -1096,11 +1139,19 @@ def setup_stdx_if_needed(args, cfgs):
         cfgs: 配置对象
     """
     if compare_versions(cfgs.BASE_CJC_VERSION, '0.61.0') >= 0:
+        if compare_versions(cfgs.BASE_CJC_VERSION, '1.0.4') > 0:
+            cfgs.CJC_RUNTIME_SUFFIX = 'cjnative'
         if not cfgs.CANGJIE_STDX_DIR:
             cfgs.LOG.info(f"仓颉版本:{cfgs.BASE_CJC_VERSION}, 需要检查stdx是否配置")
             if cfgs.WHICH_CJC:
                 cfgs.IS_SELF_CONFIGURATION = True
                 cfgs.LOG.info("当前环境变量已经设置仓颉, 检查CANGJIE_HOME中是否存在stdx")
+                cfgs.CANGJIE_HOME = os.path.dirname(os.path.dirname(shutil.which("cjc")))
+                if cfgs.CANGJIE_HOME is None:
+                    cfgs.CANGJIE_HOME = os.environ.get('CANGJIE_HOME', None)
+                if cfgs.CANGJIE_HOME is None:
+                    cfgs.LOG.warn("未找到 CANGJIE_HOME 环境变量, 无法配置 stdx")
+                cfgs.LOG.info(f"CANGJIE_HOME: {cfgs.CANGJIE_HOME}")
             else:
                 cfgs.WHICH_CJC = shutil.which("cjc")
                 cfgs.LOG.info("未配置仓颉环境, 正在配置指定的路径的stdx")
@@ -1122,7 +1173,7 @@ def setup_stdx_if_needed(args, cfgs):
                 targ = f"linux_x86_64_{cfgs.CJC_RUNTIME_SUFFIX}"
             elif "darwin" in cfgs.CANGJIE_TARGET or "apple" in cfgs.CANGJIE_TARGET:
                 if "aarch64" in cfgs.CANGJIE_TARGET or "arm64" in cfgs.CANGJIE_TARGET:
-                    targ = f"darwin_arm64_{cfgs.CJC_RUNTIME_SUFFIX}"
+                    targ = f"darwin_aarch64_{cfgs.CJC_RUNTIME_SUFFIX}"
                 else:
                     targ = f"darwin_x86_64_{cfgs.CJC_RUNTIME_SUFFIX}"
             elif "windows" in cfgs.CANGJIE_TARGET:
@@ -1263,6 +1314,13 @@ def find_cjc_in_cj_home(args, cfgs, expected_version):
     return None
 
 
+def _bind_system_cjc(cfgs):
+    """绑定系统 cjc，并同步 CANGJIE_HOME，避免只设置 WHICH_CJC 导致后续路径解析为空"""
+    cfgs.WHICH_CJC = shutil.which("cjc")
+    if cfgs.WHICH_CJC:
+        cfgs.CANGJIE_HOME = os.path.dirname(os.path.dirname(cfgs.WHICH_CJC))
+
+
 def config_cjc(args):
     """
     配置 cjc 环境（优化后的逻辑）
@@ -1274,9 +1332,10 @@ def config_cjc(args):
     """
     cfgs = args.CANGJIE_CI_TEST_CFGS
 
-    # 设置命令日志输出模式
+    # 设置命令日志输出模式（命令行显式指定时优先，并标记避免重复初始化时被 cfg 覆盖）
     if hasattr(args, 'log_cmd') and args.log_cmd:
         cfgs.LOG_CMD = args.log_cmd
+        cfgs.LOG_CMD_FROM_CLI = True
 
     # 设置是否显示编译告警
     if hasattr(args, 'show_warn'):
@@ -1314,7 +1373,7 @@ def config_cjc(args):
         if expected_version and system_version:
             if compare_versions(system_version, expected_version) == 0:
                 cfgs.LOG.info(f"系统中的 cjc 版本 {system_version} 与期望版本 {expected_version} 一致")
-                cfgs.WHICH_CJC = shutil.which("cjc")
+                _bind_system_cjc(cfgs)
                 cfgs.BASE_CJC_VERSION = system_version
 
                 # 设置 build_bin 和 LIB_DIR
@@ -1362,7 +1421,7 @@ def config_cjc(args):
 
                 # cj_home 中未找到期望版本，使用系统的 cjc
                 cfgs.LOG.warn(f"使用系统中的 cjc 版本 {system_version}（未找到期望版本 {expected_version}）")
-                cfgs.WHICH_CJC = shutil.which("cjc")
+                _bind_system_cjc(cfgs)
                 cfgs.BASE_CJC_VERSION = system_version
 
                 # 设置 build_bin 和 LIB_DIR
@@ -1378,7 +1437,7 @@ def config_cjc(args):
                 return
         else:
             cfgs.LOG.info("系统中已配置 cjc 环境")
-            cfgs.WHICH_CJC = shutil.which("cjc")
+            _bind_system_cjc(cfgs)
             if system_version:
                 cfgs.BASE_CJC_VERSION = system_version
 
@@ -1481,8 +1540,6 @@ def init_log(cfgs, name, log_file_path=None):
 
     log.setLevel(logging.DEBUG)
     formatter = logging.Formatter("[%(asctime)s] %(levelname)s - %(message)s", "%m-%d %H:%M:%S")
-    if platform.system() == 'Windows':
-        sys.stdout.reconfigure(encoding='utf-8')
     streamhandler = logging.StreamHandler(sys.stdout)
     streamhandler.setLevel(logging.DEBUG)
     streamhandler.setFormatter(formatter)
@@ -1505,15 +1562,16 @@ def init_log(cfgs, name, log_file_path=None):
 
 
 def parser_maple_test_config_file(cfgs: ArgConfig):
-    if cfgs.BUILD_TYPE == "ci_test":
-        cfg = read_config(complete_path(os.path.join(cfgs.FILE_ROOT, "ci_test.cfg")))
-    else:
-        cfg = read_config(complete_path(os.path.join(cfgs.BASE_DIR, "ci_test.cfg")))
+    cfg = read_layered_config()
     cfgs.temp_dir = complete_path(
         os.path.join(cfgs.BASE_DIR, get_config_value(cfg, "running", "temp_dir", default="../test_temp/run")))
     cfgs.log_dir = complete_path(
         os.path.join(cfgs.BASE_DIR, get_config_value(cfg, "logging", "name", default="../test_temp/log")))
     cfgs.level = get_config_value(cfg, "logging", "level", default="INFO")
+    # 命令日志输出方式：命令行 --log-cmd 已指定时不再被 cfg 覆盖
+    if not getattr(cfgs, "LOG_CMD_FROM_CLI", False):
+        log_cmd = get_config_value(cfg, "logging", "log_cmd", default="simple")
+        cfgs.LOG_CMD = log_cmd if log_cmd in ("simple", "full") else "simple"
     cfgs.UPDATE_CJPM_TOML = get_config_value(cfg, "cangjie-home", "update_toml", default="false") == "true"
     cfgs.BUILD_CI_TEST_CFG = cfg
 
@@ -1556,17 +1614,15 @@ def __check_git_credentials():
     try:
         result = subprocess.run(
             ['git', 'config', '--global', 'user.name'],
-            capture_output=True,
-            text=True
+            capture_output=True
         )
-        user_name = result.stdout.strip()
+        user_name = decode_text(result.stdout).strip()
 
         result = subprocess.run(
             ['git', 'config', '--global', 'user.email'],
-            capture_output=True,
-            text=True
+            capture_output=True
         )
-        user_email = result.stdout.strip()
+        user_email = decode_text(result.stdout).strip()
 
         if user_name and user_email:
             return True, f"Git已配置: {user_name} <{user_email}>"
@@ -1604,6 +1660,41 @@ def __get_git_clone_url(base_url: str, use_ssh: bool = False) -> str:
     return base_url
 
 
+CI_LIB_REMOTE_URL = 'https://gitcode.com/Cangjie-TPC/ci_lib.git'
+
+
+def __mask_git_url(url):
+    pwd = os.environ.get('gitcode_password', '')
+    return url.replace(pwd, '****') if pwd else url
+
+
+def __clone_ci_lib(cfgs, branch, dest, cwd):
+    """克隆 ci_lib 指定分支：优先从远端 gitcode 实时克隆（ci_lib 随时变动，保证最新）；
+    失败时回退 CI_LIB_GIT_URL（镜像内置的本地 mirror，离线兜底，不卡死）。
+    网络鲁棒性参数对齐 CI checkout 脚本 git_clone.py 的云上 Docker 绕行方案。"""
+    primary = os.environ.get('CI_LIB_GIT_URL', CI_LIB_REMOTE_URL)
+    remote = __get_git_clone_url(CI_LIB_REMOTE_URL)
+    attempts = [remote] if primary == CI_LIB_REMOTE_URL else [remote, primary]
+    for url in attempts:
+        cfgs.LOG.info(f"clone ci_lib 分支 {branch} <- {__mask_git_url(url)}")
+        env_vars = {**os.environ,
+                    'GIT_SSL_NO_VERIFY': '1',
+                    'GIT_DNS_THREADS': '0',
+                    'MALLOC_ARENA_MAX': '2',
+                    'GIT_PREFER_IPV4': '1',
+                    'ASYNC_DNS': '0',
+                    'RES_OPTIONS': 'timeout:5 attempts:1 rotate'}
+        cmd = f"git clone -b {branch} {url} {dest} --depth=1"
+        output = subprocess.Popen(cmd, shell=True, cwd=cwd, stderr=subprocess.PIPE,
+                                  stdout=subprocess.PIPE, env=env_vars)
+        log_output(output, output.args, cfgs, cfgs.HOME_DIR, timeout=300)
+        if output.returncode == 0:
+            return True
+        cfgs.LOG.warn(f"从 {__mask_git_url(url)} 克隆 {branch} 失败，returncode={output.returncode}")
+        shutil.rmtree(dest, ignore_errors=True)  # 清理残留目录，避免影响后续尝试/误判已存在
+    return False
+
+
 def __load_c_library(args, cfgs):
     ffi_lib = os.path.join(cfgs.HOME_DIR, "ci_test", f"lib_{cfgs.MODULE_NAME}")
     if not os.path.exists(ffi_lib):
@@ -1616,21 +1707,7 @@ def __load_c_library(args, cfgs):
                 cfgs.LOG.error("或者设置环境变量: gitcode_username 和 gitcode_password")
                 return
 
-        base_url = "https://gitcode.com/Cangjie-TPC/ci_lib.git"
-        clone_url = __get_git_clone_url(base_url)
-
-        if clone_url != base_url:
-            cfgs.LOG.info("使用环境变量中的gitcode凭证进行clone")
-
-        cmd = f"git clone -b lib_{cfgs.MODULE_NAME} {clone_url} {ffi_lib} --depth 1"
-        output = subprocess.Popen(
-            cmd,
-            shell=True,
-            cwd=cfgs.HOME_DIR,
-            stderr=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-        )
-        log_output(output, output.args, cfgs)
+        __clone_ci_lib(cfgs, f"lib_{cfgs.MODULE_NAME}", ffi_lib, cfgs.HOME_DIR)
     ffi_bin_path = os.path.join(ffi_lib, cfgs.OS_PLATFORM, 'lib', f"lib_{cfgs.MODULE_NAME}")
     if os.path.isdir(ffi_bin_path):
         entries = os.listdir(ffi_bin_path)
@@ -1653,6 +1730,23 @@ def delete_suffix_file(filepath, suffix_name):
     for file in os.listdir(filepath):
         if '.' in file and file.split('.')[-1] == suffix_name:
             os.remove(os.path.join(filepath, file))
+
+
+def clean(args):
+    cfgs = args.CANGJIE_CI_TEST_CFGS
+    # 删除编译产物目录
+    for build_dir in ("target", "build"):
+        path = os.path.join(cfgs.HOME_DIR, build_dir)
+        if os.path.exists(path):
+            cfgs.LOG.info(f"清理编译产物目录: {path}")
+            shutil.rmtree(path, ignore_errors=True)
+    # 删除覆盖率缓存文件
+    for suffix in ("gcda", "gcno"):
+        files = glob.glob(os.path.join(cfgs.HOME_DIR, "**", f"*.{suffix}"), recursive=True)
+        for file in files:
+            os.remove(file)
+        cfgs.LOG.info(f"清理 .{suffix} 文件 {len(files)} 个")
+    cfgs.LOG.info("clean 完成.")
 
 
 def runBuild(args, cfgs):
@@ -1740,7 +1834,7 @@ def __do_cjpm_build(args, cfgs):
     if args.full:
         cmd0 = "{} update".format(get_cjc_cpm(cfgs))
         output = subprocess.Popen(cmd0, shell=True, cwd=cfgs.HOME_DIR, stderr=subprocess.PIPE, stdout=subprocess.PIPE)
-        _, err_log = __log_output(output, output.args, cfgs, cfgs.HOME_DIR)
+        _, err_log = __log_output(output, output.args, cfgs, cfgs.HOME_DIR, timeout=600)
         if output.returncode != 0:
             if str(err_log).__contains__("can not find the library"):
                 sub_librarys = []
@@ -1752,7 +1846,7 @@ def __do_cjpm_build(args, cfgs):
                 __loop_down_load_cjpm_librarys(cfgs, sub_librarys)
                 output = subprocess.Popen(cmd0, shell=True, cwd=cfgs.HOME_DIR, stderr=subprocess.PIPE,
                                           stdout=subprocess.PIPE)
-                _, err_log = __log_output(output, output.args, cfgs, cfgs.HOME_DIR)
+                _, err_log = __log_output(output, output.args, cfgs, cfgs.HOME_DIR, timeout=600)
             else:
                 cfgs.LOG.error("build fail")
     else:
@@ -1772,8 +1866,8 @@ def __do_cjpm_build(args, cfgs):
                         'lto': ""
                     },
                     'customized-option': {
-                        'debug': "-g -Woff all -Won apilevel-check",
-                        'release': "--fast-math -O2 -s -Woff all -Won apilevel-check"
+                        'debug': "-g -Woff all",
+                        'release': "--fast-math -O2 -s -Woff all"
                     },
                     'test': {}
                 }
@@ -1794,8 +1888,8 @@ def __do_cjpm_build(args, cfgs):
                         'lto': ""
                     },
                     'customized-option': {
-                        'debug': "-g -Woff all -Won apilevel-check",
-                        'release': "--fast-math -O2 -s -Woff all -Won apilevel-check"
+                        'debug': "-g -Woff all",
+                        'release': "--fast-math -O2 -s -Woff all"
                     },
                     'test': {}
                 }
@@ -1834,15 +1928,14 @@ def __cjpm_git_download_json(cfgs, sub_library, sub_library_config_file):
     parm = json.load(file)
     ffi = parm["foreign_requires"]
     name = parm['name']
-    gitee = "https://gitcode.com/Cangjie-TPC/ci_lib.git"
-    gitee = __get_git_clone_url(gitee)
     for ke, val in ffi.items():
         for k, v in val.items():
             if k == 'path':
-                cmd0 = f"git clone -b lib_{name} {gitee} {os.path.join(cfgs.BASE_DIR, f'lib_{name}')} --depth=1"
-                output = subprocess.Popen(cmd0, shell=True, cwd=cfgs.BASE_DIR, stderr=subprocess.PIPE,
-                                          stdout=subprocess.PIPE)
-                log_output(output, output.args, cfgs, cfgs.HOME_DIR)
+                clone_dir = os.path.join(cfgs.BASE_DIR, f'lib_{name}')
+                if os.path.exists(clone_dir):
+                    cfgs.LOG.info(f"目录已存在，跳过 clone: {clone_dir}")
+                else:
+                    __clone_ci_lib(cfgs, f"lib_{name}", clone_dir, cfgs.BASE_DIR)
                 old_dir = os.path.join(cfgs.BASE_DIR, "lib_{}".format(name), cfgs.OS_PLATFORM, "lib", f"lib_{name}")
                 str_lib = __get_cjpm_library_cjpm_lock_foreign_requires_path(cfgs, sub_library)
                 new_dir = os.path.join(sub_library, str_lib)
@@ -1863,7 +1956,8 @@ def __get_cjpm_target_from_os_platform(cfgs):
         'linux_aarch64': 'aarch64-unknown-linux-gnu',
         'windows': 'x86_64-unknown-windows-gnu',
         'darwin_x86_64': 'x86_64-apple-darwin',
-        'darwin_arm64': 'aarch64-apple-darwin'
+        'darwin_arm64': 'aarch64-apple-darwin',
+        'darwin_aarch64': 'aarch64-apple-darwin'
     }
     return platform_mapping.get(cfgs.OS_PLATFORM)
 
@@ -1872,10 +1966,6 @@ def __cjpm_git_download_toml(cfgs, sub_library, sub_library_config_file):
     cfgs.LOG.info(f"check file {sub_library_config_file}")
     parm = parse(open(sub_library_config_file, "r", encoding='UTF-8').read())
     name = parm['package']['name']
-    gitee = "https://gitcode.com/Cangjie-TPC/ci_lib.git"
-    gitee = __get_git_clone_url(gitee)
-    cfgs.LOG.info(
-        f"使用 Git URL: {gitee.replace(os.environ.get('gitcode_password', ''), '****') if os.environ.get('gitcode_password') else gitee}")
 
     # 检查是否存在旧格式的 ffi.c 配置（且不为空）
     has_ffi_c = 'ffi' in parm and 'c' in parm['ffi'] and len(parm['ffi']['c']) > 0
@@ -1900,10 +1990,10 @@ def __cjpm_git_download_toml(cfgs, sub_library, sub_library_config_file):
             for k, v in val.items():
                 if k == 'path':
                     clone_dir = os.path.join(cfgs.BASE_DIR, f'lib_{name}')
-                    cmd0 = f"git clone -b lib_{name} {gitee} {clone_dir} --depth=1"
-                    output = subprocess.Popen(cmd0, shell=True, cwd=cfgs.BASE_DIR, stderr=subprocess.PIPE,
-                                              stdout=subprocess.PIPE)
-                    log_output(output, output.args, cfgs, cfgs.HOME_DIR)
+                    if os.path.exists(clone_dir):
+                        cfgs.LOG.info(f"目录已存在，跳过 clone: {clone_dir}")
+                    else:
+                        __clone_ci_lib(cfgs, f"lib_{name}", clone_dir, cfgs.BASE_DIR)
 
                     # 构建源目录路径
                     old_dir = os.path.join(cfgs.BASE_DIR, "lib_{}".format(name), cfgs.OS_PLATFORM, "lib",
@@ -1938,10 +2028,10 @@ def __cjpm_git_download_toml(cfgs, sub_library, sub_library_config_file):
             for k, v in val.items():
                 if k == 'path':
                     clone_dir = os.path.join(cfgs.BASE_DIR, f'lib_{name}')
-                    cmd0 = f"git clone -b lib_{name} {gitee} {clone_dir} --depth=1"
-                    output = subprocess.Popen(cmd0, shell=True, cwd=cfgs.BASE_DIR, stderr=subprocess.PIPE,
-                                              stdout=subprocess.PIPE)
-                    log_output(output, output.args, cfgs, cfgs.HOME_DIR)
+                    if os.path.exists(clone_dir):
+                        cfgs.LOG.info(f"目录已存在，跳过 clone: {clone_dir}")
+                    else:
+                        __clone_ci_lib(cfgs, f"lib_{name}", clone_dir, cfgs.BASE_DIR)
 
                     # 构建源目录路径
                     old_dir = os.path.join(cfgs.BASE_DIR, "lib_{}".format(name), cfgs.OS_PLATFORM, "lib",
@@ -2093,6 +2183,7 @@ def compare_versions(v1: str, v2: str) -> int:
 
 
 def set_cangjie_home(cfgs, cjc_home):
+    cfgs.CANGJIE_HOME = cjc_home
     if cfgs.OS_PLATFORM == "windows":
         cfgs.LOG.info("The current environment is Windows")
         cangjie_bin = os.path.join(cjc_home, 'bin')
@@ -2106,16 +2197,14 @@ def set_cangjie_home(cfgs, cjc_home):
         if cangjie_tools not in os.environ['Path']:
             cangjie_path += f'{cangjie_tools};'
         os.environ['Path'] = f"{cangjie_path}{os.environ['Path']}"
-        if not os.getenv('CANGJIE_HOME'):
-            os.environ['CANGJIE_HOME'] = f"{cjc_home}"
-        if not os.getenv('CANGJIE_STDX_PATH'):
-            os.environ['CANGJIE_STDX_PATH'] = f"{cjc_home}"
+        os.environ['CANGJIE_HOME'] = f"{cjc_home}"
+        os.environ['CANGJIE_STDX_PATH'] = f"{cjc_home}"
     elif cfgs.OS_PLATFORM.startswith("darwin"):
         cfgs.LOG.info("The current environment is Mac")
         cangjie_bin = os.path.join(cjc_home, 'bin')
         cangjie_tools = os.path.join(cjc_home, 'tools', 'bin')
-        if 'aarch64' in cfgs.OS_PLATFORM:
-            cangjie_runtime = os.path.join(cjc_home, 'runtime', 'lib', f'darwin_arm64_{cfgs.CJC_RUNTIME_SUFFIX}')
+        if 'aarch64' in cfgs.OS_PLATFORM or 'arm64' in cfgs.OS_PLATFORM:
+            cangjie_runtime = os.path.join(cjc_home, 'runtime', 'lib', f'darwin_aarch64_{cfgs.CJC_RUNTIME_SUFFIX}')
         else:
             cangjie_runtime = os.path.join(cjc_home, 'runtime', 'lib', f'darwin_x86_64_{cfgs.CJC_RUNTIME_SUFFIX}')
         os.environ['PATH'] = f"{cangjie_bin}:{cangjie_tools}:" + os.environ['PATH']
@@ -2241,7 +2330,7 @@ def do_load_library_cfg(cfg_path):
 def set_build_log_warnings_count(cfgs, err):
     try:
         len = str(err).count('[33mwarning')
-        cfg = read_config(complete_path(choose_method(cfgs)))
+        cfg = read_config(complete_path(choose_method(cfgs))) or configparser.ConfigParser()
         if cfg.has_section("build-warning"):
             cfg.set("build-warning", 'warning', str(len))
         else:
@@ -2253,20 +2342,21 @@ def set_build_log_warnings_count(cfgs, err):
 
 
 def set_cjtest_path(args, cfgs, target):
-    cfg = read_config(complete_path(choose_method(cfgs)))
+    cfg = read_config(complete_path(choose_method(cfgs))) or configparser.ConfigParser()
     cfg.set("test", target, args.root)
     cfg.write(open(choose_method(cfgs), 'w', encoding='UTF-8'))
 
 
 def get_cjtest_path(args, cfgs, target):
-    cfg = read_config(complete_path(choose_method(cfgs)))
+    cfg = read_layered_config()
     key = '3rd_party_root' if target != 'ohos' else '3rd_party_root_ohos'
     if cfg.has_section("test"):
         return cfg.get("test", key)
+    return ""
 
 
 def get_cangjie_path(cfgs, p):
-    cfg = read_config(complete_path(choose_method(cfgs)))
+    cfg = read_layered_config()
     if cfg.has_section("cangjie-home"):
         return cfg.get("cangjie-home", p)
     else:
@@ -2274,7 +2364,7 @@ def get_cangjie_path(cfgs, p):
 
 
 def _get_DEVECO_CANGJIE_HOME(cfgs):
-    cfg = read_config(complete_path(choose_method(cfgs)))
+    cfg = read_layered_config()
     try:
         if cfg.has_section("cangjie-home"):
             compile_option = cfg.get("cangjie-home", "OHOS_compile_option")
@@ -2297,7 +2387,7 @@ def _get_DEVECO_CANGJIE_HOME(cfgs):
 
 
 def set_cangjie_path(args, cfgs):
-    cfg = read_config(complete_path(choose_method(cfgs)))
+    cfg = read_config(complete_path(choose_method(cfgs))) or configparser.ConfigParser()
     if cfg.has_section("cangjie-home"):
         cfg.set("cangjie-home", 'home', args.cj_home)
     else:
@@ -2314,11 +2404,46 @@ def parser_run_config_file(run_config: Path):
             "internal_var": dict(cfg.items("internal_var"))}
 
 
+def cfg_candidates():
+    """分级 cfg 的两个候选路径：脚本目录（基线）与当前工作目录（优先）"""
+    script_cfg = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ci_test.cfg")
+    local_cfg = os.path.join(os.getcwd(), "ci_test.cfg")
+    return script_cfg, local_cfg
+
+
+def read_layered_config():
+    """按配置项合并多级 cfg（低 -> 高）：脚本目录为基线，当前目录逐项覆盖。
+
+    只有高优先级文件显式提供且非空的配置项才会覆盖低优先级；
+    空值视为“未配置”，继续继承低优先级配置，形成配置项级别的梯级体系。
+    """
+    script_cfg, local_cfg = cfg_candidates()
+    config = configparser.ConfigParser()
+    config.optionxform = str
+    for path in (script_cfg, local_cfg):
+        if not os.path.isfile(path):
+            continue
+        layer = configparser.ConfigParser()
+        layer.optionxform = str
+        layer.read(path, encoding="utf-8")
+        for section in layer.sections():
+            if not config.has_section(section):
+                config.add_section(section)
+            for option, value in layer.items(section):
+                if value.strip() == "" and config.has_option(section, option):
+                    continue
+                config.set(section, option, value)
+    return config
+
+
 def choose_method(cfgs):
-    if cfgs.BUILD_TYPE == 'ci_test':
-        return os.path.join(cfgs.FILE_ROOT, "ci_test.cfg")
-    else:
-        return os.path.join(cfgs.BASE_DIR, "ci_test.cfg")
+    """返回 cfg 写入目标：当前目录存在 ci_test.cfg 则写它，否则沿用脚本目录基线（兼容 CI 布局）"""
+    script_cfg, local_cfg = cfg_candidates()
+    if os.path.isfile(local_cfg):
+        return local_cfg
+    if os.path.isfile(script_cfg):
+        return script_cfg
+    return local_cfg
 
 
 def complete_path(path):
@@ -2480,9 +2605,9 @@ def setup_external_libs(cfgs, test_dir, log=None):
             else:
                 logger.info(f"git clone {git_url} (branch={branch}) -> {lib_dest}")
                 clone_cmd = f"git clone -b {branch} --depth=1 {git_url} {lib_dest}"
-                clone_result = subprocess.run(clone_cmd, shell=True, capture_output=True, text=True)
+                clone_result = subprocess.run(clone_cmd, shell=True, capture_output=True)
                 if clone_result.returncode != 0:
-                    logger.warning(f"git clone 失败: {clone_result.stderr.strip()}")
+                    logger.warning(f"git clone 失败: {decode_text(clone_result.stderr).strip()}")
                     continue
             build_cwd = os.path.join(lib_dest, subdir) if subdir else lib_dest
             # 如果指定的 subdir 不存在，自动搜索含 cjpm.toml 或 module.json 的目录作为编译目录
@@ -2501,9 +2626,9 @@ def setup_external_libs(cfgs, test_dir, log=None):
             else:
                 logger.info(f"cjpm build {build_cwd}")
                 build_cmd = "cjpm update && cjpm build"
-                build_result = subprocess.run(build_cmd, shell=True, cwd=build_cwd, capture_output=True, text=True)
+                build_result = subprocess.run(build_cmd, shell=True, cwd=build_cwd, capture_output=True)
                 if build_result.returncode != 0:
-                    logger.warning(f"cjpm build 失败: {build_result.stderr.strip()}")
+                    logger.warning(f"cjpm build 失败: {decode_text(build_result.stderr).strip()}")
                 else:
                     logger.info(f"cjpm build 完成")
                     cjpm_build_success = True
@@ -2535,9 +2660,9 @@ def setup_external_libs(cfgs, test_dir, log=None):
             branch = parts[1].strip() if len(parts) > 1 else "master"
             logger.info(f"git clone {git_url} (branch={branch}) -> {lib_dest}")
             clone_cmd = f"git clone -b {branch} --depth=1 {git_url} {lib_dest}"
-            clone_result = subprocess.run(clone_cmd, shell=True, capture_output=True, text=True)
+            clone_result = subprocess.run(clone_cmd, shell=True, capture_output=True)
             if clone_result.returncode != 0:
-                logger.warning(f"git clone 失败: {clone_result.stderr.strip()}")
+                logger.warning(f"git clone 失败: {decode_text(clone_result.stderr).strip()}")
                 continue
         elif value.startswith("url:"):
             url = value[4:].strip()
@@ -2740,7 +2865,7 @@ class ProcessLogger(threading.Thread):
                     time.sleep(0.1)
                     continue
                 if not llt_check_not_start_or_end_with_target(line):
-                    msg = line.decode('UTF-8', 'ignore').rstrip()
+                    msg = decode_text(line).rstrip()
                     msg = msg.replace('\xa0', ' ').replace('\u00a0', ' ')
                     msg = ''.join(char if ord(char) < 0x10000 else '?' for char in msg)
                     self.logger.info(msg)
@@ -2760,13 +2885,20 @@ class ProcessLogger(threading.Thread):
         self._stop_event.set()
 
 
-def __log_output(output, cmd, cfgs, filename=None):
+def __log_output(output, cmd, cfgs, filename=None, timeout=None):
     """ log command output"""
     cfgs.LOG.info("CMD    : %s", cfgs._simplify_cmd(str(cmd)))
-    stdout, stderr = output.communicate()
-    encode = cfgs.ENCODING
-    error = stderr.decode(encode, "ignore").strip()
-    out = stdout.decode(encode, "ignore").strip()
+    if timeout is not None:
+        try:
+            stdout, stderr = output.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            output.kill()
+            stdout, stderr = output.communicate()
+            cfgs.LOG.error(f"命令超时({timeout}秒)，进程已终止: {cfgs._simplify_cmd(str(cmd))}")
+    else:
+        stdout, stderr = output.communicate()
+    error = decode_text(stderr).strip()
+    out = decode_text(stdout).strip()
     if error:
         for item in re.split("\r?\n", error):
             item = re.sub(r"\x1b\[\d+m", "", item)
@@ -2781,7 +2913,37 @@ def __log_output(output, cmd, cfgs, filename=None):
     return out, error
 
 
-def log_output(proc, cmd, cfgs, filename=None):
+_mysql_ready_checked = False
+
+
+def _wait_for_mysql_ready(cfgs, timeout=60):
+    """等待容器内测试数据库就绪（镜像设置 MYSQL_HOST 环境变量时启用）。
+    背景：镜像 entrypoint 为兼容 Jenkins 入口检查改为后台拉起服务，测试执行前需确认 DB 就绪；
+    未配置 MYSQL_HOST 的环境（无数据库的镜像）不等待。"""
+    global _mysql_ready_checked
+    if _mysql_ready_checked:
+        return
+    _mysql_ready_checked = True
+    host = os.environ.get('MYSQL_HOST', '')
+    if not host:
+        return
+    port = os.environ.get('MYSQL_PORT', '3306')
+    cfgs.LOG.info(f"等待测试数据库就绪: {host}:{port}（最长 {timeout} 秒）")
+    import socket as _socket
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        try:
+            with _socket.create_connection((host, int(port)), timeout=2):
+                cfgs.LOG.info(f"测试数据库就绪: {host}:{port}（耗时 {time.time() - start_time:.1f} 秒）")
+                return
+        except OSError:
+            time.sleep(1)
+    cfgs.LOG.error(f"等待测试数据库超时（{timeout} 秒）: {host}:{port} 不可达，依赖数据库的用例将失败")
+    cfgs.LOG.error("排查: docker exec <容器> 'ps aux | grep mysqld' 与 docker logs <容器>；"
+                   "并确认 Jenkins 未以 --entrypoint='' 或非 root 用户运行容器")
+
+
+def log_output(proc, cmd, cfgs, filename=None, timeout=None):
     """ log command output"""
     cfgs.LOG.info("CMD    : %s", cfgs._simplify_cmd(str(cmd)))
     stdout_logger = ProcessLogger(proc.stdout, cfgs.LOG, "")
@@ -2789,12 +2951,17 @@ def log_output(proc, cmd, cfgs, filename=None):
     stdout_logger.start()
     stderr_logger.start()
     try:
+        _start_time = time.time()
         while proc.poll() is None:
+            if timeout is not None and (time.time() - _start_time) > timeout:
+                proc.kill()
+                cfgs.LOG.error(f"命令超时({timeout}秒)，进程已被终止: {cmd}")
+                break
             time.sleep(0.1)
         proc.wait()
 
         stdout, stderr = proc.communicate()
-        return stdout.decode(cfgs.ENCODING, "ignore").strip(), stderr.decode(cfgs.ENCODING, "ignore").strip()
+        return decode_text(stdout).strip(), decode_text(stderr).strip()
     finally:
         stdout_logger.stop()
         stderr_logger.stop()
@@ -2934,6 +3101,7 @@ def runOne(args, file, subcmd, cfgs):
                         pass
                 filtered_library = filter_library_by_imports(cfgs.LIBRARY, import_pkgs, cfgs.HOME_DIR)
                 executed_cmds = set()  # 记录已执行的命令，避免重复执行和日志重复打印
+                _wait_for_mysql_ready(cfgs)
                 for item in exec:
                     cmd_temp = item
                     cmd = form_line(item, {"import-path": cfgs.IMPORT_PATH})
@@ -2949,6 +3117,30 @@ def runOne(args, file, subcmd, cfgs):
                         cmd = form_line(cmd, {"f": path.name})
                     if "cjc" in cmd:
                         cmd = cmd + subcmd + args.optimize + cfgs.Woff
+                        # Mac 平台: 将 runtime/stdx 目录和所有 -L 库目录内嵌为 LC_RPATH。
+                        # ./main 经由 /bin/sh(SIP 平台二进制) 执行时 DYLD_* 会被 dyld 剥离;
+                        # 而 stdx dylib 的 install name 是 @rpath/xxx.dylib, 运行期只能靠
+                        # 可执行文件自身的 LC_RPATH 展开, 否则找不到 libcangjie-runtime.dylib、
+                        # libcangjie-dynamicLoader-opensslFFI.dylib 等动态库。
+                        # 注意: cjc 不支持 -Wl,-rpath 透传, 需用 --link-options(0.53.18+ 全支持)
+                        if cfgs.OS_PLATFORM and cfgs.OS_PLATFORM.startswith("darwin"):
+                            rpath_dirs = []
+                            cjc_home = cfgs.CANGJIE_HOME or os.environ.get('CANGJIE_HOME')
+                            if cjc_home:
+                                # runtime 目录历史上有 aarch64/arm64 两种命名, 存在的都加上
+                                for arch in ("aarch64", "arm64", "x86_64"):
+                                    runtime_dir = os.path.join(cjc_home, 'runtime', 'lib',
+                                                               f'darwin_{arch}_{cfgs.CJC_RUNTIME_SUFFIX}')
+                                    if os.path.isdir(runtime_dir):
+                                        rpath_dirs.append(runtime_dir)
+                            if cfgs.CANGJIE_STDX_DIR and os.path.isdir(cfgs.CANGJIE_STDX_DIR):
+                                rpath_dirs.append(cfgs.CANGJIE_STDX_DIR)
+                            # 所有 -L 链接目录同样要作为 rpath, 运行期才能解析 @rpath 引用
+                            for lib_dir in re.findall(r'-L\s+(\S+)', cmd):
+                                if os.path.isdir(lib_dir):
+                                    rpath_dirs.append(lib_dir)
+                            for rpath_dir in dict.fromkeys(rpath_dirs):  # 去重保序
+                                cmd += f' --link-options "-rpath {rpath_dir}"'
                     # 去重：form_line 替换后相同的命令只执行一次
                     if cmd in executed_cmds:
                         continue
@@ -3095,21 +3287,21 @@ def __improt_stdx_libs(libsdir, cfgs=None, args=None, is_recursion=True):
         if str(ss).__contains__('aspects'):  # 这里 1.0.3 测试报错. 先屏蔽这个链接
             continue
         if not args.fuzz:
-            if "stdx.fuzz.fuzz" not in ss:
+            if "stdx.fuzz.fuzz" not in ss and "stdx.fuzz" not in ss  :
                 cfgs.LIBRARY += "-l {} ".format(ss)
         else:
             cfgs.LIBRARY += "-l {} ".format(ss)
 
 
 def loop_dir(args, cfgs, callBack):
+    """遍历用例目录；args.path 限定目录树，args.case 在该树内按文件名过滤"""
     currentDirectory = cfgs.TEST_DIR
     global TOTAL_CASES
     if args.path:
-        if os.path.abspath(args.path).startswith(currentDirectory):
+        if os.path.isdir(args.path):
             currentDirectory = args.path
         else:
-            cfgs.LOG.error("指定测试文件夹不是当前工程的子文件夹. 请重试")
-            exit(1)
+            cfgs.LOG.warning(f"指定测试文件夹不存在: {args.path}，回退到默认目录: {currentDirectory}")
     for path, dirs, files in os.walk(currentDirectory):
         for item in files:
             if Path(item).suffix == ".cj":
@@ -3285,16 +3477,16 @@ class Logger:
         self.logger.addHandler(self.th)
 
     def info(self, msg):
-        self.logger.info(msg.encode('gbk', 'ignore').decode('gbk'))
+        self.logger.info(msg)
 
     def debug(self, msg):
-        self.logger.debug(msg.encode('gbk', 'ignore').decode('gbk'))
+        self.logger.debug(msg)
 
     def error(self, msg):
-        self.logger.error(msg.encode('gbk', 'ignore').decode('gbk'))
+        self.logger.error(msg)
 
     def warning(self, msg):
-        self.logger.warning(msg.encode('gbk', 'ignore').decode('gbk'))
+        self.logger.warning(msg)
 
     def setStream(self, file_name):
         dirs = file_name.split(os.sep)
@@ -3315,8 +3507,8 @@ class Logger:
 
 # cfgs.CJ_TEST_WORK = ""
 
-cp = configparser.ConfigParser()
-cp.read(os.path.join(os.path.dirname(__file__), "ci_test.cfg"))
+# 分级配置：脚本目录 cfg 为基础，当前工作目录 cfg 同名项优先
+cp = read_layered_config()
 _3rd_party_root = ""
 
 platform_str = sys.platform
@@ -3544,6 +3736,15 @@ def collect_test_result(file_path, output, return_code, run_time):
             test_report["cases"][class_name] = []
             test_report["class_times"][class_name] = 0.0
 
+        test_report["class_files"].setdefault(class_name, file_path)
+        stats = test_report["class_stats"].setdefault(class_name, {"failed": 0, "error": 0, "skipped": 0})
+        if status == "FAILED":
+            stats["failed"] += 1
+        elif status == "ERROR":
+            stats["error"] += 1
+        elif status == "SKIPPED":
+            stats["skipped"] += 1
+
         test_report["cases"][class_name].append([file_name, status, run_time, error_trace, 0.0, file_path])
         test_report["class_times"][class_name] += run_time
     else:
@@ -3559,11 +3760,19 @@ def collect_test_result(file_path, output, return_code, run_time):
             test_report["cases"][class_name] = []
             test_report["class_times"][class_name] = 0.0
 
+        # 记录用例文件路径与按文件的失败/错误/跳过统计
+        # （框架不会为 SKIPPED 用例输出单条记录，按文件统计用于最终报告的文件维度展示）
+        test_report["class_files"].setdefault(class_name, file_path)
+        test_report["class_stats"][class_name] = {"failed": failed_cases, "error": error_cases,
+                                                  "skipped": skipped_cases}
+
         # 保存原始输出，用于后续补充解析失败/错误用例
         test_report["raw_outputs"][class_name] = clean_output
 
         # 解析具体的用例结果
-        for line in output.split('\n'):
+        # 注意：必须使用去除 ANSI 转义序列后的 clean_output，
+        # 原始输出中状态标记形如 "[ \x1b[32m PASSED \x1b[0m ]"，直接匹配会失败
+        for line in clean_output.split('\n'):
             if "[ PASSED ] CASE:" in line:
                 case_match = re.search(r"\[ PASSED \] CASE:\s*(\w+)", line)
                 if case_match:
@@ -3776,6 +3985,20 @@ def filter_library_by_imports(library_str, import_pkgs, home_dir=None):
                 return f"{parts[1]}::{parts[0]}"
         return lib_name
 
+    def pkg_name_to_lib_name(pkg_name):
+        """将包名转换为库名（lib_name_to_pkg_name 的逆转换）
+
+        dep-cache 和 import 语句中的包名格式为 module::package（如 cangjie_tpc::zlib4cj），
+        而磁盘上库文件命名为 package@module（如 libzlib4cj@cangjie_tpc.so），
+        链接时 -l 必须使用磁盘上的 @ 格式，否则 ld 报 "找不到 -lxxx::yyy"
+        例如: cangjie_tpc::zlib4cj -> zlib4cj@cangjie_tpc
+        """
+        if "::" in pkg_name:
+            parts = pkg_name.split("::")
+            if len(parts) == 2:
+                return f"{parts[1]}@{parts[0]}"
+        return pkg_name
+
     def is_macro_package(pkg_name):
         """检查包是否是宏包"""
         if not dep_cache:
@@ -3859,15 +4082,17 @@ def filter_library_by_imports(library_str, import_pkgs, home_dir=None):
 
     # 第二遍：添加隐式依赖
     for implicit_dep in implicit_deps:
-        # 检查是否是宏包，如果是，添加 -macro_ 前缀
+        # 检查是否是宏包，如果是，添加 -macro_ 前缀（宏包判断需使用 dep-cache 的 :: 格式包名）
         if dep_cache:
             is_macro = is_macro_package(implicit_dep)
+            # dep-cache 中的包名是 module::package 格式（如 cangjie_tpc::zlib4cj），
+            # 磁盘上库文件命名为 package@module（如 libzlib4cj@cangjie_tpc.so），
+            # 链接时必须转换为 @ 格式，否则 ld 找不到库
+            lib_name = pkg_name_to_lib_name(implicit_dep)
             if is_macro:
-                lib_name = f"-macro_{implicit_dep}"
-            else:
-                lib_name = implicit_dep
+                lib_name = f"-macro_{lib_name}"
         else:
-            lib_name = implicit_dep
+            lib_name = pkg_name_to_lib_name(implicit_dep)
 
         # 去重检查
         if lib_name not in seen:
@@ -3977,18 +4202,17 @@ def run_one_case(args, file_path, run_option, compile_option, target, cfgs):
     else:
         if platform_str == "linux":
             ld_path = os.environ.get('LD_LIBRARY_PATH', '')
-            run_case_cmd = f"cd {out_dir};LD_LIBRARY_PATH=\"{ld_path}\" ./{out_file} {run_option} {fuzz_cmd} -timeout=10800"
+            run_case_cmd = f"cd {out_dir};LD_LIBRARY_PATH=\"{ld_path}\" ./{out_file} {run_option} {fuzz_cmd} --timeout-each=10800s"
         elif platform_str == "darwin":
             dyld_path = os.environ.get('DYLD_LIBRARY_PATH', '')
-            run_case_cmd = f"cd {out_dir};DYLD_LIBRARY_PATH=\"{dyld_path}:$DYLD_LIBRARY_PATH\" ./{out_file} {run_option} {fuzz_cmd} -timeout=10800"
+            run_case_cmd = f"cd {out_dir};DYLD_LIBRARY_PATH=\"{dyld_path}:$DYLD_LIBRARY_PATH\" ./{out_file} {run_option} {fuzz_cmd} --timeout-each=10800s"
         else:  # windows
-            run_case_cmd = f"cd {out_dir}&{out_file} {run_option} {fuzz_cmd}"
+            run_case_cmd = f"cd {out_dir}&{out_file} {run_option} {fuzz_cmd} "
 
     # 记录测试开始时间
     test_start_time = time.time()
 
     # 使用原来的等待逻辑，确保命令执行完成
-    encode = 'gbk' if cfgs.OS_PLATFORM == "windows" else "utf-8"
     res = subprocess.Popen(run_case_cmd, shell=True, cwd=out_dir, stderr=subprocess.STDOUT, stdout=subprocess.PIPE)
 
     # 收集输出内容
@@ -3997,7 +4221,7 @@ def run_one_case(args, file_path, run_option, compile_option, target, cfgs):
     try:
         while res.poll() is None:
             for msg in iter(res.stdout.readline, b''):
-                msg = str(msg, encode, errors='ignore').strip()
+                msg = decode_text(msg).strip()
                 if msg != "":
                     output_lines.append(msg)
                     if not llt_check_not_start_or_end_with_target(msg):
@@ -4281,8 +4505,23 @@ def gen_junit_report(cfgs, cases, tcs_time):
     show_case_list(fail_list, "Failed")
     show_case_list(error_list, "Error")
     show_case_list(skip_list, "Skipped")
-    logger.info("*" * 50)
-    logger.info("View the full log in log/all.log, or view the log of each case under log/split_log")
+
+    # 打印失败用例的文件路径
+    fail_paths = set()
+    for class_name, cases in test_report["cases"].items():
+        for case in cases:
+            if len(case) >= 6:
+                case_name, status, _, _, _, file_path = case[:6]
+            else:
+                case_name, status = case[0], case[1]
+                file_path = ""
+            if "FAILED" in status and file_path:
+                fail_paths.add(file_path)
+    if fail_paths:
+        logger.info("*" * 50)
+        logger.info("Failed test case files:")
+        for p in sorted(fail_paths):
+            logger.info(p)
     if fail_count == 0 and error_count == 0:
         return 0
     else:
@@ -4339,6 +4578,10 @@ def gen_report_from_dict(cfgs):
     fail_list = []
     error_list = []
     skip_list = []
+    # 列表按用例文件维度展示，用集合去重（同一文件内多个失败用例只列一次）
+    fail_seen = set()
+    error_seen = set()
+    skip_seen = set()
 
     for class_name, cases in test_report["cases"].items():
         class_time = test_report["class_times"].get(class_name, 0.0)
@@ -4366,16 +4609,25 @@ def gen_report_from_dict(cfgs):
                 fail_info = Et.SubElement(testcase, "failure")
                 fail_info.text = error_trace
                 class_failures += 1
-                fail_list.append(file_path if file_path else f"{class_name}.{case_name}")
+                entry = file_path if file_path else f"{class_name}.cj"
+                if entry not in fail_seen:
+                    fail_seen.add(entry)
+                    fail_list.append(entry)
             elif "ERROR" in status:
                 error_info = Et.SubElement(testcase, "error")
                 error_info.text = error_trace
                 class_errors += 1
-                error_list.append(file_path if file_path else f"{class_name}.{case_name}")
+                entry = file_path if file_path else f"{class_name}.cj"
+                if entry not in error_seen:
+                    error_seen.add(entry)
+                    error_list.append(entry)
             elif "SKIP" in status:
                 Et.SubElement(testcase, "skipped")
                 class_skipped += 1
-                skip_list.append(file_path if file_path else f"{class_name}.{case_name}")
+                entry = file_path if file_path else f"{class_name}.cj"
+                if entry not in skip_seen:
+                    skip_seen.add(entry)
+                    skip_list.append(entry)
 
             class_total += 1
 
@@ -4407,35 +4659,23 @@ def gen_report_from_dict(cfgs):
     logger.info(
         f"Ratio  : {round((test_report['passed_cases'] + test_report['skipped_cases']) / test_report['total_cases'] * 100, 2) if test_report['total_cases'] > 0 else 0}%")
 
-    # 补充解析：如果 fail_list/error_list/skip_list 为空但计数大于0，从原始输出中提取
+    # 补充对账：用例级记录可能少于汇总计数（框架不为 SKIPPED 用例输出单条记录，
+    # 个别异常输出也可能解析不到用例级记录）。此时按文件维度的统计（class_stats）
+    # 补充对应的用例文件，保证 Failed/Error/Skipped 列表展示的是用例文件路径
     if len(fail_list) < fail_count or len(error_list) < error_count or len(skip_list) < skip_count:
-        for class_name, raw_output in test_report.get("raw_outputs", {}).items():
-            for line in raw_output.split('\n'):
-                if len(fail_list) < fail_count:
-                    m = re.search(r"\[ FAILED \] CASE:\s*(\S+)", line)
-                    if m and f"{class_name}.{m.group(1)}" not in fail_list:
-                        fail_list.append(f"{class_name}.{m.group(1)}")
-                        continue
-                    m = re.search(r"CASE:\s*(\S+).*FAILED", line) or re.search(r"(\S+).*\bFAILED\b", line)
-                    if m and f"{class_name}.{m.group(1)}" not in fail_list and "TOTAL" not in line and "PASSED" not in line:
-                        fail_list.append(f"{class_name}.{m.group(1)}")
-                        continue
-
-                if len(error_list) < error_count:
-                    m = re.search(r"\[ ERROR \] CASE:\s*(\S+)", line)
-                    if m and f"{class_name}.{m.group(1)}" not in error_list:
-                        error_list.append(f"{class_name}.{m.group(1)}")
-                        continue
-                    m = re.search(r"CASE:\s*(\S+).*ERROR", line) or re.search(r"(\S+).*\bERROR\b", line)
-                    if m and f"{class_name}.{m.group(1)}" not in error_list and "TOTAL" not in line and "PASSED" not in line:
-                        error_list.append(f"{class_name}.{m.group(1)}")
-                        continue
-
-                if len(skip_list) < skip_count:
-                    m = re.search(r"\[ SKIPPED \] CASE:\s*(\S+)", line)
-                    if m and f"{class_name}.{m.group(1)}" not in skip_list:
-                        skip_list.append(f"{class_name}.{m.group(1)}")
-                        continue
+        for class_name, stats in test_report.get("class_stats", {}).items():
+            class_file = test_report.get("class_files", {}).get(class_name, "")
+            if not class_file:
+                continue
+            if len(fail_list) < fail_count and stats.get("failed", 0) > 0 and class_file not in fail_seen:
+                fail_seen.add(class_file)
+                fail_list.append(class_file)
+            if len(error_list) < error_count and stats.get("error", 0) > 0 and class_file not in error_seen:
+                error_seen.add(class_file)
+                error_list.append(class_file)
+            if len(skip_list) < skip_count and stats.get("skipped", 0) > 0 and class_file not in skip_seen:
+                skip_seen.add(class_file)
+                skip_list.append(class_file)
 
     # 如果仍然无法提取到具体的用例名，添加提示信息
     if fail_count > 0 and len(fail_list) == 0:
@@ -4465,6 +4705,70 @@ def gen_report(args, cfgs):
         return gen_report_from_dict(cfgs)
 
 
+# 全局缓存：CANGJIE_HOME/lib 下递归搜索到的 libclang_rt.fuzzer_no_main.a 路径
+# 该库随平台/运行时存放在 lib 下不同目录（如 linux_x86_64_llvm / linux_aarch64_cjnative）
+_fuzz_lib_path = None
+
+
+def _match_fuzz_lib_by_platform(found, cfgs=None):
+    """多个候选路径时，按当前系统平台/架构选择合适的 libclang_rt.fuzzer_no_main.a
+
+    lib 目录命名如 linux_x86_64_llvm / linux_aarch64_cjnative / darwin_arm64_llvm，
+    优先级：1) 系统平台(linux/darwin/windows)匹配 2) 架构(x86_64/aarch64)匹配
+    3) 运行时后缀(cjnative/llvm)匹配；均不命中时维持搜索顺序取第一个。
+    """
+    system = platform.system().lower()
+    machine = platform.machine().lower()
+    archs = ('aarch64', 'arm64') if machine in ('aarch64', 'arm64') else ('x86_64',)
+    suffix = getattr(cfgs, 'CJC_RUNTIME_SUFFIX', 'llvm') or 'llvm'
+
+    def _score(path):
+        d = os.path.basename(os.path.dirname(path)).lower()
+        return (0 if system in d else 1,
+                0 if any(a in d for a in archs) else 1,
+                0 if d.endswith(f'_{suffix}') else 1)
+
+    return min(found, key=_score)
+
+
+def get_fuzz_lib_path(cfgs):
+    """在 CANGJIE_HOME/lib 下递归搜索 libclang_rt.fuzzer_no_main.a，结果缓存到全局变量
+
+    只搜到 1 个时直接使用；搜到多个时按当前系统平台/架构选择合适的路径。
+    未搜索到时返回 None（调用方拼接路径兜底，让编译错误暴露环境问题）。
+
+    Returns:
+        str or None: 库文件绝对路径；未搜索到返回 None
+    """
+    global _fuzz_lib_path
+    if _fuzz_lib_path:
+        return _fuzz_lib_path
+
+    if not cfgs.CANGJIE_HOME:
+        cfgs.LOG.warning("CANGJIE_HOME 未配置，跳过 libclang_rt.fuzzer_no_main.a 搜索")
+        return None
+    lib_root = os.path.join(cfgs.CANGJIE_HOME, 'lib')
+    found = []
+    if os.path.isdir(lib_root):
+        for root, _dirs, files in os.walk(lib_root):
+            if 'libclang_rt.fuzzer_no_main.a' in files:
+                found.append(os.path.join(root, 'libclang_rt.fuzzer_no_main.a'))
+
+    if not found:
+        cfgs.LOG.warning(f"未在 {lib_root} 下搜索到 libclang_rt.fuzzer_no_main.a")
+        return None
+
+    if len(found) == 1:
+        _fuzz_lib_path = found[0]
+        cfgs.LOG.info(f"fuzz lib 路径: {_fuzz_lib_path}")
+    else:
+        # 多个路径时按系统平台/架构选择合适的路径
+        _fuzz_lib_path = _match_fuzz_lib_by_platform(found, cfgs)
+        cfgs.LOG.info(f"lib 下搜索到 {len(found)} 个 libclang_rt.fuzzer_no_main.a，"
+                      f"按系统平台/架构选用: {_fuzz_lib_path}")
+    return _fuzz_lib_path
+
+
 def HLTtest(args, cfgs):
     global _3rd_party_root
     global logger
@@ -4478,28 +4782,44 @@ def HLTtest(args, cfgs):
     else:
         test_dir = 'HLT'
     cfgs.CJ_TEST_WORK = "test"
-    if not os.path.exists(os.path.join(cfgs.HOME_DIR, cfgs.CJ_TEST_WORK, test_dir)):
-        logger.error(f"{os.path.join(cfgs.HOME_DIR, cfgs.CJ_TEST_WORK, test_dir)} test case not exists!")
-        exit(0)
-    run_options = cp.get("test", "run_options")
-    compile_options = cp.get("test", "compile_options")
+    run_options = cp.get("test", "run_options", fallback="--no-progress")
+    compile_options = cp.get("test", "compile_options", fallback="--test -Woff all --dy-std")
     target = "x86"
-    if args.path:
-        dirs = os.path.join(cfgs.HOME_DIR, args.path)
-    else:
-        dirs = os.path.join(cfgs.HOME_DIR, cfgs.CJ_TEST_WORK, test_dir)
+    default_dirs = os.path.join(cfgs.HOME_DIR, cfgs.CJ_TEST_WORK, test_dir)
+    dirs = default_dirs
+    if args.path and not args.fuzz:
+        # 支持任意目录（fuzz 复用 HLTtest，但目录规则由其下方分支自行处理）
+        path = args.path
+        if not os.path.isabs(path):
+            path = os.path.join(cfgs.HOME_DIR, path)
+        path = os.path.abspath(path)
+        if os.path.isdir(path):
+            dirs = path
+        else:
+            logger.warning(f"指定测试目录不存在: {path}，回退到默认目录: {default_dirs}")
     if args.target:
         target = args.target
         _3rd_party_root = get_cjtest_path(args, cfgs, args.target)
     elif args.main:
-        os.environ['cjHeapSize'] = cp.get("test", "cjHeapSize")
+        os.environ['cjHeapSize'] = cp.get("test", "CJHEAPSIZE", fallback=cp.get("test", "cjHeapSize", fallback="1GB"))
         compile_options = compile_options.replace("--test", '')
     elif args.fuzz:
         # os.environ["CANGJIE_PATH"] = f"{fuzz_lib}:{os.getenv('CANGJIE_PATH')}"
         compile_options = compile_options.replace("--test", '')
-        compile_options += f' --link-options="--whole-archive {cfgs.CANGJIE_HOME}/lib/linux_x86_64_{cfgs.CJC_RUNTIME_SUFFIX}/libclang_rt.fuzzer_no_main.a -no-whole-archive -lstdc++" --sanitizer-coverage-trace-compares --sanitizer-coverage-pc-table --sanitizer-coverage-inline-8bit-counters'
-        fuzz_runs = cp.get("test", "fuzz_runs")
-        fuzz_rss_limit_mb = cp.get("test", "fuzz_rss_limit_mb")
+        # libclang_rt.fuzzer_no_main.a 随平台/运行时存放在 lib 下不同目录（如 linux_x86_64_llvm、
+        # linux_aarch64_cjnative），直接递归搜索实际存在的路径并缓存到全局变量，后续直接从全局变量取
+        fuzz_lib = get_fuzz_lib_path(cfgs)
+        if fuzz_lib is None and cfgs.CANGJIE_HOME:
+            # 搜索不到时按运行时后缀拼接路径兜底，让编译错误暴露环境问题
+            fuzz_lib = os.path.join(cfgs.CANGJIE_HOME, 'lib',
+                                    f'linux_x86_64_{cfgs.CJC_RUNTIME_SUFFIX}',
+                                    'libclang_rt.fuzzer_no_main.a')
+        if not fuzz_lib:
+            cfgs.LOG.error("无法定位 fuzz 运行时库 libclang_rt.fuzzer_no_main.a，请检查仓颉环境配置")
+            exit(1)
+        compile_options += f' --link-options="--whole-archive {fuzz_lib} -no-whole-archive -lstdc++" --sanitizer-coverage-trace-compares --sanitizer-coverage-pc-table --sanitizer-coverage-inline-8bit-counters'
+        fuzz_runs = cp.get("test", "fuzz_runs", fallback="")
+        fuzz_rss_limit_mb = cp.get("test", "fuzz_rss_limit_mb", fallback="")
         if fuzz_runs:
             args.fuzz_runs = fuzz_runs
         else:
@@ -4509,20 +4829,32 @@ def HLTtest(args, cfgs):
         else:
             args.fuzz_rss_limit_mb = 4096
         fuzz_dir = os.path.join(cfgs.HOME_DIR, cfgs.CJ_TEST_WORK, "fuzz")
-        if args.path and str(args.path).startswith(str(fuzz_dir)) and os.path.exists(args.path):
-            cfgs.LOG.info(f"指定测试路径：{args.path}")
-            dirs = args.path
-        else:
-            if os.path.exists(fuzz_dir):
-                dirs = fuzz_dir
-            elif os.path.exists(os.path.join(cfgs.HOME_DIR, cfgs.CJ_TEST_WORK, "FUZZ")):
-                dirs = os.path.join(cfgs.HOME_DIR, cfgs.CJ_TEST_WORK, "FUZZ")
+        fuzz_dir_upper = os.path.join(cfgs.HOME_DIR, cfgs.CJ_TEST_WORK, "FUZZ")
+        default_dirs = fuzz_dir if os.path.isdir(fuzz_dir) else fuzz_dir_upper
+        if args.path:
+            # 支持任意目录；相对路径基于工程根目录解析，不存在时回退到默认目录
+            path = args.path
+            if not os.path.isabs(path):
+                path = os.path.join(cfgs.HOME_DIR, path)
+            path = os.path.abspath(path)
+            if os.path.isdir(path):
+                cfgs.LOG.info(f"指定测试路径：{path}")
+                dirs = path
             else:
-                cfgs.LOG.error("当前仓库中没有test/fuzz目录, 请检查后再试.")
-                exit(1)
+                cfgs.LOG.warning(f"指定测试路径不存在: {path}，回退到默认目录: {default_dirs}")
+                dirs = default_dirs
+        else:
+            dirs = default_dirs
+        if not os.path.isdir(dirs):
+            cfgs.LOG.error("当前仓库中没有test/fuzz目录, 请检查后再试.")
+            exit(1)
 
     # else:
     #     run_options += f"{arg}"
+
+    if not os.path.isdir(dirs):
+        logger.error(f"{dirs} test case not exists!")
+        exit(0)
 
     shutil.rmtree(os.path.join(cfgs.HOME_DIR, cfgs.CJ_TEST_WORK, "tmp"), ignore_errors=True)
     shutil.rmtree(os.path.join(cfgs.HOME_DIR, cfgs.CJ_TEST_WORK, "log"), ignore_errors=True)
@@ -4581,8 +4913,14 @@ def HLTtest(args, cfgs):
     # 跟踪已运行的用例文件
     completed_case_files = set()
 
+    _signal_handler_entered = False
+
     def signal_handler(sig, frame):
         global test_report
+        if _signal_handler_entered:
+            logger.info("\n再次收到中断信号，强制退出...")
+            os._exit(1)
+        _signal_handler_entered = True
         logger.info("\n收到中断信号，正在生成测试报告...")
         try:
             # 将未运行的用例计为跳过
@@ -4600,7 +4938,7 @@ def HLTtest(args, cfgs):
             gen_report(args, cfgs)
         except Exception as e:
             logger.error(f"生成报告时出错: {e}")
-        exit(1)
+        os._exit(1)
 
     signal.signal(signal.SIGINT, signal_handler)
 

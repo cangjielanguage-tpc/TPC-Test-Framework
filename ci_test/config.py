@@ -8,6 +8,7 @@ import shutil
 import platform
 import subprocess
 from tomlkit import parse
+from textio import decode_text
 
 str_head_1 = [233, 166, 131, 208, 152, 32, 116, 101, 115, 116, 32]
 str_head_2 = [27, 91, 52, 70, 27, 55, 27, 91, 57, 57, 57, 57, 69, 27, 91, 51, 70, 233, 166, 131, 230, 145, 157, 32, 103, 114, 111, 117, 112, 32, 100, 101, 102, 97, 117, 108, 116]
@@ -180,7 +181,6 @@ class ArgConfig:
     BASE_DIR = None
     HOME_DIR = None
     HOME = None
-    ENCODING = None
     FILE_ROOT = None
     LIB_DIR = None
     BUILD_BIN = "build"
@@ -379,13 +379,12 @@ class ArgConfig:
         return " ".join(simplified)
 
     def run_cmd(self, cmd, file_dir="./"):
-        encode = 'gbk' if self.OS_PLATFORM == "windows" else "utf-8"
         self.LOG.info("CMD    : %s", self._simplify_cmd(cmd))
         res = subprocess.Popen(cmd, shell=True, cwd=file_dir, stderr=subprocess.STDOUT, stdout=subprocess.PIPE)
         try:
             while res.poll() is None:
                 for msg in iter(res.stdout.readline, b''):
-                    msg = str(msg, encode, errors='ignore').strip()
+                    msg = decode_text(msg).strip()
                     if msg != "":
                         if not llt_check_not_start_or_end_with_target(msg):
                             self.LOG.info(msg)

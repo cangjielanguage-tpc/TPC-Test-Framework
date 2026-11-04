@@ -24,6 +24,12 @@
     1. `test1.cj`是用例的名称
     1. 加不加后缀都可以识别
     1. 无需考虑目录层级 会扫描整个LLT目录树
+1. 指定目录运行: `ciTest test -p test/LLT/subdir`
+    1. 支持绝对路径或相对路径（相对路径以工程根目录为基准）
+    1. 不限制目录位置，可以指定工程外的任意目录
+    1. 指定目录不存在时输出 warning，并自动回退到默认测试目录 `<工程>/test`
+1. 目录与用例联动: `ciTest test -p test/LLT/subdir --case test1`
+    1. `-p` 限定扫描目录树，`--case` 在该目录树内按文件名匹配
 
 ## 使用脚本运行HLT测试用例
 
@@ -34,6 +40,88 @@
     1. `test1.cj`是HLT目录里用例的名称
     1. 加不加后缀都可以识别
     1. 无需考虑目录层级 会扫描整个HLT目录树
+1. 指定目录运行: `ciTest cjtest -p test/HLT/subdir`
+    1. 支持绝对路径或相对路径（相对路径以工程根目录为基准）
+    1. 不限制目录位置，可以指定工程外的任意目录
+    1. 指定目录不存在时输出 warning，并自动回退到默认目录 `<工程>/test/HLT`
+1. 目录与用例联动: `ciTest cjtest -p test/HLT/subdir --case test1`
+    1. `-p` 限定扫描目录树，`--case` 在该目录树内按文件名匹配
+
+## 使用脚本运行 fuzz / bench 用例
+
+1. 进入三方库根目录
+1. fuzz: 执行`ciTest fuzz`命令，默认扫描 `test/fuzz`（不存在时回退 `test/FUZZ`）
+1. bench: 执行`ciTest bench`命令，默认扫描 `test/benchmark`
+1. 指定目录运行: `ciTest fuzz -p <目录>` / `ciTest bench -p <目录>`
+    1. 支持绝对路径或相对路径（相对路径以工程根目录为基准）
+    1. 不限制目录位置，可以指定工程外的任意目录
+    1. 指定目录不存在时输出 warning，并自动回退到各自的默认目录
+    1. `--case` 同样可与 `-p` 联动，限定目录树内的单条用例
+1. 说明: fuzz 和 bench 的三方库根目录（root）默认取项目根目录的上一级（workspace）；fuzz 要求 root 非空，可通过 `ci_test.cfg` 或 `--root` 设置（见下节）
+1. fuzz 环境依赖: 需能定位到 `libclang_rt.fuzzer_no_main.a`（位于仓颉环境 `CANGJIE_HOME/lib` 下）。`CANGJIE_HOME` 由系统 `cjc` 自动推导；使用其他版本时由 `[cangjie-home] home` 选中的版本目录确定。定位失败会直接报错退出
+
+## 配置文件（配置项级融合）
+
+脚本启动时按配置项合并两级 `ci_test.cfg`（低 -> 高）：
+
+1. 当前工作目录：`$PWD/ci_test.cfg`，优先级最高。该文件为项目级配置，已被 `.gitignore` 忽略，请勿提交
+2. 脚本目录：`src/ci_test/ci_test.cfg`，随仓库提交的基线配置
+
+合并粒度是**配置项**，不是文件：高优先级文件只覆盖它显式提供且非空的项，其余项继续继承下一级；空值视为“未配置”。两级都没有的项使用代码内置默认值，命令行参数（`--root`、`--log-cmd`、`--cj-home`）优先级高于所有 cfg。
+
+写操作（`--root`、构建告警统计、`--cj-home`）写入当前目录的 `ci_test.cfg`（存在时）；当前目录没有 cfg 时沿用脚本目录基线（兼容 CI 布局）。
+
+配置项使用整行注释（`#`），因为 `configparser` 不支持行尾注释。
+
+### 命令日志输出方式
+
+`--log-cmd` 控制命令行的打印粒度：`simple` 折叠 `--import-path`/`-L`/`-l` 等冗长参数，`full` 全量打印。默认 `simple`，可在 `ci_test.cfg` 中改为 `full`：
+
+```ini
+[logging]
+level = INFO
+log_cmd = full
+```
+
+优先级：命令行 `--log-cmd` > 逐项合并后的 `[logging] log_cmd` > 默认 `simple`。该配置对 `build`/`test`/`llt`/`cjtest`/`hlt` 生效。
+
+## --root 参数说明
+
+`--root` 用于设置三方库根目录（对应 `ci_test.cfg` 的 `[test] 3rd_party_root`），语义是 **workspace 目录**，即项目根目录的上一级（通常同时包含源码仓和用例仓），不是项目根目录本身。
+
+### 生效范围
+
+- `// macro-lib:`：`get_cmd_info` 会把宏库相对路径与 root 拼接；
+- `// 3rd_party_lib:`：当前代码只用于判定用例有效，不参与路径拼接，因此不受 root 影响；
+- `-p/--path` 只决定用例目录，与 root 无关。
+
+### 加载顺序
+
+1. 命令行 `--root`：优先级最高，同时会写回本地 `ci_test.cfg`；
+2. `ci_test.cfg` 的 `[test] 3rd_party_root`（`--target=ohos` 时读取 `3rd_party_root_ohos`）；
+3. 代码默认值：`HOME_DIR` 的上一级（项目根目录的上一级），仅当前两级为空时生效。
+
+补充：`--target=ohos` 分支会无条件读取 `3rd_party_root_ohos`，该字段为空时不会回退到默认值。
+
+### 典型取值
+
+```text
+/home/young/repos                  <- --root / 默认 workspace
+├── httpclient4cj/                 <- 源码仓
+└── test4tpc_httpclient4cj/        <- 用例仓（在此执行 ciTest hlt）
+```
+
+在项目根目录（如 `test4tpc_httpclient4cj`）执行时，默认 root 自动为 `/home/young/repos`，通常无需传 `--root`。
+
+### 何时需要手动设置
+
+1. 用例包含 `// macro-lib:`，且宏库相对路径基址不是默认 workspace；
+2. 源码仓与用例仓不在同一 workspace，宏库位于第三个目录；
+3. CI 需要在多个 workspace 间切换。
+
+### 写入行为
+
+使用 `--root` 时，脚本会把值写入当前目录的 `ci_test.cfg`（存在时；`--target=ohos` 时写 `3rd_party_root_ohos`），当前目录无 cfg 则写入脚本目录基线。该项目级文件已被 `.gitignore` 忽略，不会进入版本库，但对本机该目录下后续所有运行持续生效。
 
 ## case_config.cfg 配置文件
 

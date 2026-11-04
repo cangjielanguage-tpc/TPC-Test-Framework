@@ -178,7 +178,7 @@ def find_valid_urls(possible_urls: List[Dict[str, str]], max_workers: int = 10, 
             if found:
                 future.cancel()
                 continue
-
+                
             completed += 1
             if completed % 10 == 0:
                 if logger:
@@ -317,11 +317,11 @@ def download_file(url: str, output_dir: str, filename: Optional[str] = None, log
             if size < 1024:
                 return f"{size}B"
             elif size < 1024 * 1024:
-                return f"{size / 1024:.1f}KB"
+                return f"{size/1024:.1f}KB"
             elif size < 1024 * 1024 * 1024:
-                return f"{size / (1024 * 1024):.1f}MB"
+                return f"{size/(1024*1024):.1f}MB"
             else:
-                return f"{size / (1024 * 1024 * 1024):.1f}GB"
+                return f"{size/(1024*1024*1024):.1f}GB"
 
         import sys
         is_windows = sys.platform == 'win32'
@@ -342,17 +342,14 @@ def download_file(url: str, output_dir: str, filename: Optional[str] = None, log
                         bar = '█' * filled + '-' * (bar_length - filled)
                     else:
                         bar = '█' * filled + '░' * (bar_length - filled)
-
+                    
                     if logger:
                         if progress - last_progress >= 10:
-                            logger.info(
-                                f"[{bar}] {progress:.1f}% ({format_size(downloaded_size)}/{format_size(total_size)})")
+                            logger.info(f"[{bar}] {progress:.1f}% ({format_size(downloaded_size)}/{format_size(total_size)})")
                             last_progress = progress
                     else:
                         if progress - last_progress >= 0.5:
-                            print(
-                                f"\r[{bar}] {progress:.1f}% ({format_size(downloaded_size)}/{format_size(total_size)})",
-                                end='', flush=True)
+                            print(f"\r[{bar}] {progress:.1f}% ({format_size(downloaded_size)}/{format_size(total_size)})", end='', flush=True)
                             last_progress = progress
 
         response.close()
